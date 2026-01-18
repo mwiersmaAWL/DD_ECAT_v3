@@ -1,0 +1,94 @@
+# Makefile for Force Feedback Project on Raspberry Pi
+
+# --- Compiler and Flags ---
+CC = gcc
+
+# Base CFLAGS:
+#   -Wall: Enable all common warnings
+#   -Wextra: Enable extra warnings
+#   -g: Include debugging information
+#   -std=c11: Use C11 standard
+#   -D_GNU_SOURCE: Enable GNU extensions
+#   -I/home/mwi/SOEM/install/include/soem: Add SOEM headers path
+CFLAGS = -Wall -Wextra -g -std=c11 -D_GNU_SOURCE -I/home/mwi/SOEM/install/include/soem
+
+# Optimization flags for servo control performance:
+#   -O3: Maximum optimization level (aggressive optimizations)
+#   -march=native: Optimize for the specific CPU architecture (Pi 4, etc.)
+#   -ffast-math: Enable fast floating-point math (trade precision for speed)
+#   -DOPTIMIZED_BUILD: Define preprocessor macro for conditional compilation
+CFLAGS += -O3 -march=native -ffast-math -DOPTIMIZED_BUILD
+
+# Additional performance flags (optional, uncomment if needed):
+# CFLAGS += -funroll-loops        # Unroll loops for better performance
+# CFLAGS += -fomit-frame-pointer  # Omit frame pointer for more registers
+# CFLAGS += -pipe                 # Use pipes instead of temporary files
+
+# LDFLAGS: Linker flags - specify libraries
+#   -lrt: Real-time extensions library (for clock_gettime)
+#   -lpthread: POSIX threads library
+#   -lm: Math library
+#   -lsoem: SOEM EtherCAT library
+#   -L/home/mwi/SOEM/install/lib: SOEM library path
+LDFLAGS = -lrt -lpthread -lm -lsoem -L/home/mwi/SOEM/install/lib
+
+# --- Project Files ---
+TARGET = ffb_app
+SRCS = main.c ffb_calculator.c hid_interface.c soem_interface.c
+# Add new source file when you create it:
+SRCS += synapticon_servo_tuning.c
+
+OBJS = $(SRCS:.c=.o) # Automatically generate .o file names from .c file names
+
+# --- Rules ---
+
+# Default rule: builds the target executable
+all: $(TARGET)
+
+# Rule to link the object files into the executable
+$(TARGET): $(OBJS)
+	@echo "Linking $(TARGET) with optimization flags..."
+	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
+	@echo "Build complete: $(TARGET) created with high-performance optimizations."
+	@echo "Optimization level: O3, Architecture: native, Fast-math: enabled"
+
+# Generic rule to compile .c files into .o files
+# $<: the first prerequisite (e.g., main.c)
+# $@: the target of the rule (e.g., main.o)
+%.o: %.c
+	@echo "Compiling $< with optimizations..."
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Debug build target (without aggressive optimizations)
+debug: CFLAGS = -Wall -Wextra -g -std=c11 -O0 -D_GNU_SOURCE -I/home/mwi/SOEM/install/include/soem -DDEBUG_BUILD
+debug: $(TARGET)
+	@echo "Debug build complete: $(TARGET) created with debugging symbols."
+
+# Clean rule: removes all generated object files and the executable
+clean:
+	@echo "Cleaning up..."
+	rm -f $(OBJS) $(TARGET)
+	@echo "Clean complete."
+
+# Install rule (optional): copy executable to system location
+install: $(TARGET)
+	@echo "Installing $(TARGET)..."
+	sudo cp $(TARGET) /usr/local/bin/
+	sudo chmod +x /usr/local/bin/$(TARGET)
+	@echo "$(TARGET) installed to /usr/local/bin/"
+
+# Performance test rule (optional)
+test-performance: $(TARGET)
+	@echo "Running performance test..."
+	sudo nice -n -10 ./$(TARGET) eth1
+	
+# Show compiler and optimization info
+info:
+	@echo "Compiler: $(CC)"
+	@echo "CFLAGS: $(CFLAGS)"
+	@echo "LDFLAGS: $(LDFLAGS)"
+	@echo "Target: $(TARGET)"
+	@echo "Sources: $(SRCS)"
+
+# Phony targets: tell make that these are not actual files 
+.PHONY: all clean debug install test-performance info

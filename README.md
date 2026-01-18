@@ -152,3 +152,14 @@ sudo reboot
 - make
 - If correctly installed:
 - sudo ./ffb_app eth1
+
+#### Phase 6: testing and improving
+- sudo cpufreq-set -g performance
+- sudo nano /boot/config.txt
+- add or replace: gpu_mem=128
+- add #include "synapticon_servo_tuning.h" to excisting files
+- Add these in main.c:
+- // Add after soem_interface_init_enhanced():
+- configure_synapticon_for_steering_wheel(1);
+- print_synapticon_status(1);
+

@@ -1,0 +1,400 @@
+// soem_interface_optimized.c - Optimized for high-frequency servo control
+// Key optimizations for 1kHz servo update rate and reduced latency
+
+#include "soem_interface.h"
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <pthread.h>
+#include <math.h>
+#include <time.h>
+#include <sched.h>
+#include <sys/mman.h>
+
+// Optimized timing for 1kHz operation
+#define OPTIMIZED_CYCLE_TIME_US 1000    // 1ms = 1kHz
+#define SERVO_RESPONSE_TIMEOUT_US 500   // 0.5ms timeout for servo response
+#define COMMUNICATION_CHECK_INTERVAL 10  // Check status every 10 cycles
+#define VELOCITY_FILTER_SAMPLES 3       // Reduced samples for faster response
+
+// Enhanced PDO structures with optimized layout
+typedef struct PACKED {
+    uint16_t controlword;
+    int16_t target_torque;
+    uint8_t modes_of_operation;
+    uint8_t reserved; // Padding for alignment
+} somanet_rx_pdo_optimized_t;
+
+typedef struct PACKED {
+    uint16_t statusword;
+    int32_t position_actual_value;
+    int16_t torque_actual_value;
+    uint8_t modes_of_operation_display;
+    uint8_t reserved; // Padding for alignment
+} somanet_tx_pdo_optimized_t;
+
+// High-performance state management
+typedef struct {
+    // Atomic variables for thread-safe access
+    volatile float target_torque;
+    volatile float current_position;
+    volatile float current_velocity;
+    volatile uint16_t statusword;
+    volatile int communication_status;
+    
+    // Performance optimization
+    float velocity_buffer[VELOCITY_FILTER_SAMPLES];
+    int32_t position_buffer[VELOCITY_FILTER_SAMPLES];
+    struct timespec time_buffer[VELOCITY_FILTER_SAMPLES];
+    int buffer_index;
+    int buffer_filled;
+    
+    // Statistics
+    uint64_t cycle_count;
+    uint64_t late_cycles;
+    uint64_t communication_errors;
+    float max_cycle_time_us;
+    float avg_cycle_time_us;
+} servo_state_t;
+
+static servo_state_t servo_state = {0};
+
+// Thread synchronization optimized for real-time
+static pthread_mutex_t servo_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t servo_thread;
+static volatile int servo_thread_running = 0;
+
+// Optimized PDO pointers
+static somanet_rx_pdo_optimized_t *servo_outputs;
+static somanet_tx_pdo_optimized_t *servo_inputs;
+
+// Fast inline functions for performance
+static inline float calculate_velocity_optimized(void) {
+    if (!servo_state.buffer_filled) return 0.0f;
+    
+    int oldest_idx = (servo_state.buffer_index + 1) % VELOCITY_FILTER_SAMPLES;
+    int newest_idx = servo_state.buffer_index;
+    
+    int32_t position_delta = servo_state.position_buffer[newest_idx] - 
+                            servo_state.position_buffer[oldest_idx];
+    
+    struct timespec *newest_time = &servo_state.time_buffer[newest_idx];
+    struct timespec *oldest_time = &servo_state.time_buffer[oldest_idx];
+    
+    float time_delta = (newest_time->tv_sec - oldest_time->tv_sec) + 
+                      (newest_time->tv_nsec - oldest_time->tv_nsec) * 1e-9f;
+    
+    if (time_delta > 0.0f) {
+        // Convert to degrees per second
+        float velocity_counts_per_sec = position_delta / time_delta;
+        return (velocity_counts_per_sec / ENCODER_COUNTS_PER_REV) * 360.0f;
+    }
+    
+    return 0.0f;
+}
+
+static inline void update_velocity_buffer(int32_t position, struct timespec *timestamp) {
+    servo_state.position_buffer[servo_state.buffer_index] = position;
+    servo_state.time_buffer[servo_state.buffer_index] = *timestamp;
+    
+    servo_state.buffer_index = (servo_state.buffer_index + 1) % VELOCITY_FILTER_SAMPLES;
+    if (!servo_state.buffer_filled && servo_state.buffer_index == 0) {
+        servo_state.buffer_filled = 1;
+    }
+}
+
+// High-performance servo control thread
+static void *optimized_servo_thread(void *param) {
+    struct timespec loop_start, loop_end, next_cycle;
+    long cycle_time_ns = OPTIMIZED_CYCLE_TIME_US * 1000L;
+    int communication_check_counter = 0;
+    float cycle_time_sum = 0.0f;
+    
+    printf("SOEM: Starting optimized servo thread at 1kHz...\n");
+    
+    // Set thread to highest priority
+    struct sched_param thread_param;
+    thread_param.sched_priority = 99;
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &thread_param);
+    
+    // Pin thread to specific CPU core
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(3, &cpuset); // Use CPU core 3 for servo thread
+    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    
+    // Initialize timing
+    clock_gettime(CLOCK_MONOTONIC, &next_cycle);
+    
+    while (servo_thread_running) {
+        clock_gettime(CLOCK_MONOTONIC, &loop_start);
+        
+        // Critical section: Update servo outputs
+        if (servo_outputs) {
+            // Atomic read of target torque
+            float target = servo_state.target_torque;
+            servo_outputs->target_torque = (int16_t)(target * 1000.0f); // Scale appropriately
+            servo_outputs->controlword = 0x000F; // Operation enabled
+            servo_outputs->modes_of_operation = 4; // Torque mode
+        }
+        
+        // High-priority PDO exchange
+        ec_send_processdata();
+        wkc = ec_receive_processdata(SERVO_RESPONSE_TIMEOUT_US);
+        
+        // Process servo inputs immediately
+        if (servo_inputs && wkc >= expectedWKC) {
+            struct timespec current_time;
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            
+            // Update position and velocity with high precision
+            int32_t raw_position = servo_inputs->position_actual_value;
+            update_velocity_buffer(raw_position, &current_time);
+            
+            // Atomic updates for thread safety
+            servo_state.current_position = (float)raw_position;
+            servo_state.current_velocity = calculate_velocity_optimized();
+            servo_state.statusword = servo_inputs->statusword;
+            servo_state.communication_status = 1;
+            
+        } else {
+            // Communication error handling
+            servo_state.communication_status = 0;
+            servo_state.communication_errors++;
+        }
+        
+        // Periodic status checks (reduced frequency)
+        if (++communication_check_counter >= COMMUNICATION_CHECK_INTERVAL) {
+            communication_check_counter = 0;
+            
+            // Check EtherCAT slave states
+            for (int i = 1; i <= ec_slavecount; i++) {
+                if (!is_slave_operational(i)) {
+                    ec_statecheck(i, EC_STATE_OPERATIONAL, 50000); // Quick state check
+                }
+            }
+        }
+        
+        // Performance monitoring
+        clock_gettime(CLOCK_MONOTONIC, &loop_end);
+        float cycle_time_us = ((loop_end.tv_sec - loop_start.tv_sec) * 1000000.0f + 
+                              (loop_end.tv_nsec - loop_start.tv_nsec) / 1000.0f);
+        
+        servo_state.cycle_count++;
+        cycle_time_sum += cycle_time_us;
+        servo_state.avg_cycle_time_us = cycle_time_sum / servo_state.cycle_count;
+        
+        if (cycle_time_us > servo_state.max_cycle_time_us) {
+            servo_state.max_cycle_time_us = cycle_time_us;
+        }
+        
+        // Precise timing control
+        next_cycle.tv_nsec += cycle_time_ns;
+        if (next_cycle.tv_nsec >= 1000000000L) {
+            next_cycle.tv_sec++;
+            next_cycle.tv_nsec -= 1000000000L;
+        }
+        
+        clock_gettime(CLOCK_MONOTONIC, &loop_end);
+        if (loop_end.tv_sec < next_cycle.tv_sec || 
+           (loop_end.tv_sec == next_cycle.tv_sec && loop_end.tv_nsec < next_cycle.tv_nsec)) {
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_cycle, NULL);
+        } else {
+            servo_state.late_cycles++;
+        }
+    }
+    
+    printf("SOEM: Optimized servo thread stopped\n");
+    return NULL;
+}
+
+// Optimized initialization with servo-specific tuning
+int soem_interface_init_optimized(const char *ifname) {
+    printf("SOEM: Initializing optimized interface for high-frequency servo control...\n");
+    
+    // Standard SOEM initialization
+    if (!ec_init(ifname)) {
+        fprintf(stderr, "SOEM: ec_init failed on %s\n", ifname);
+        return -1;
+    }
+    
+    if (ec_config_init(FALSE) <= 0) {
+        fprintf(stderr, "SOEM: No slaves found\n");
+        return -1;
+    }
+    
+    printf("SOEM: Found %d slaves\n", ec_slavecount);
+    
+    // Configure optimized PDO mapping for minimal latency
+    uint16_t slave_idx = 1;
+    
+    // Set optimized sync manager configuration
+    // SM0: Mailbox out, SM1: Mailbox in, SM2: Process data out, SM3: Process data in
+    ec_slave[slave_idx].SM[2].StartAddr = 0x1100;
+    ec_slave[slave_idx].SM[2].SMlength = sizeof(somanet_rx_pdo_optimized_t);
+    ec_slave[slave_idx].SM[2].SMflags = 0x00010044; // Output, PDO, Watchdog
+    
+    ec_slave[slave_idx].SM[3].StartAddr = 0x1200;
+    ec_slave[slave_idx].SM[3].SMlength = sizeof(somanet_tx_pdo_optimized_t);
+    ec_slave[slave_idx].SM[3].SMflags = 0x00010020; // Input, PDO
+    
+    // Configure distributed clocks for precise synchronization
+    ec_configdc();
+    
+    // Map IO with optimized layout
+    if (ec_config_map(&IOmap) == 0) {
+        fprintf(stderr, "SOEM: IO mapping failed\n");
+        return -1;
+    }
+    
+    // Assign optimized PDO pointers
+    servo_outputs = (somanet_rx_pdo_optimized_t *)(ec_slave[slave_idx].outputs);
+    servo_inputs = (somanet_tx_pdo_optimized_t *)(ec_slave[slave_idx].inputs);
+    
+    if (!servo_outputs || !servo_inputs) {
+        fprintf(stderr, "SOEM: PDO pointer assignment failed\n");
+        return -1;
+    }
+    
+    expectedWKC = (ec_group[0].outputsWKC * 2) + ec_group[0].inputsWKC;
+    
+    // Initialize servo-specific parameters for high performance
+    printf("SOEM: Configuring servo for high-frequency operation...\n");
+    
+    // Set interpolation time to 1ms for smooth operation
+    uint8_t interpolation_time = 1;
+    int8_t time_index = -3;
+    soem_interface_write_sdo(slave_idx, 0x60C2, 0x01, sizeof(interpolation_time), &interpolation_time);
+    soem_interface_write_sdo(slave_idx, 0x60C2, 0x02, sizeof(time_index), &time_index);
+    
+    // Set torque mode with optimized parameters
+    int8_t torque_mode = 4;
+    soem_interface_write_sdo(slave_idx, 0x6060, 0x00, sizeof(torque_mode), &torque_mode);
+    
+    // Enable quick stop for safety
+    uint16_t quick_stop_option = 2; // Immediate stop
+    soem_interface_write_sdo(slave_idx, 0x605A, 0x00, sizeof(quick_stop_option), &quick_stop_option);
+    
+    // Set velocity and acceleration limits for safety
+    uint32_t max_velocity = 3000; // RPM (adjust for your motor)
+    uint32_t max_acceleration = 10000; // RPM/s
+    soem_interface_write_sdo(slave_idx, 0x607F, 0x00, sizeof(max_velocity), &max_velocity);
+    soem_interface_write_sdo(slave_idx, 0x6083, 0x00, sizeof(max_acceleration), &max_acceleration);
+    soem_interface_write_sdo(slave_idx, 0x6084, 0x00, sizeof(max_acceleration), &max_acceleration);
+    
+    // Initialize servo state
+    memset(&servo_state, 0, sizeof(servo_state));
+    
+    // Transition to operational state
+    printf("SOEM: Transitioning to operational state...\n");
+    soem_interface_set_ethercat_state(slave_idx, EC_STATE_SAFE_OP);
+    
+    // Send initial PDO data
+    if (servo_outputs) {
+        memset(servo_outputs, 0, sizeof(somanet_rx_pdo_optimized_t));
+        servo_outputs->controlword = 0x0006; // Shutdown
+        servo_outputs->modes_of_operation = 4; // Torque mode
+    }
+    
+    // Exchange initial PDO data
+    for (int i = 0; i < 10; i++) {
+        ec_send_processdata();
+        ec_receive_processdata(EC_TIMEOUTRET);
+        usleep(1000);
+    }
+    
+    // Transition to operational
+    soem_interface_set_ethercat_state(slave_idx, EC_STATE_OPERATIONAL);
+    
+    // Start high-frequency servo thread
+    servo_thread_running = 1;
+    if (pthread_create(&servo_thread, NULL, optimized_servo_thread, NULL) != 0) {
+        fprintf(stderr, "SOEM: Failed to create optimized servo thread\n");
+        return -1;
+    }
+    
+    // Wait for thread to stabilize
+    usleep(10000);
+    
+    printf("SOEM: Optimized initialization completed successfully\n");
+    printf("SOEM: Servo control frequency: %d Hz\n", 1000000 / OPTIMIZED_CYCLE_TIME_US);
+    printf("SOEM: Expected latency: < %.1f ms\n", OPTIMIZED_CYCLE_TIME_US / 1000.0f);
+    
+    return 0;
+}
+
+// Optimized interface functions with minimal latency
+void soem_interface_send_torque_optimized(float target_torque) {
+    // Atomic update - no mutex needed for single float write
+    servo_state.target_torque = target_torque;
+}
+
+float soem_interface_get_position_optimized(void) {
+    return servo_state.current_position;
+}
+
+float soem_interface_get_velocity_optimized(void) {
+    return servo_state.current_velocity;
+}
+
+int soem_interface_get_status_optimized(void) {
+    return servo_state.communication_status;
+}
+
+uint16_t soem_interface_get_statusword_optimized(void) {
+    return servo_state.statusword;
+}
+
+// Performance monitoring functions
+void soem_interface_get_performance_stats(uint64_t *cycles, uint64_t *late_cycles, 
+                                         float *avg_time, float *max_time, uint64_t *errors) {
+    if (cycles) *cycles = servo_state.cycle_count;
+    if (late_cycles) *late_cycles = servo_state.late_cycles;
+    if (avg_time) *avg_time = servo_state.avg_cycle_time_us;
+    if (max_time) *max_time = servo_state.max_cycle_time_us;
+    if (errors) *errors = servo_state.communication_errors;
+}
+
+void soem_interface_print_performance_stats(void) {
+    float efficiency = (servo_state.cycle_count > 0) ? 
+        (1.0f - (float)servo_state.late_cycles / servo_state.cycle_count) * 100.0f : 0.0f;
+    
+    printf("=== SOEM Performance Statistics ===\n");
+    printf("Cycles: %lu, Late cycles: %lu, Efficiency: %.2f%%\n",
+           servo_state.cycle_count, servo_state.late_cycles, efficiency);
+    printf("Timing: Avg=%.3f µs, Max=%.3f µs, Target=%d µs\n",
+           servo_state.avg_cycle_time_us, servo_state.max_cycle_time_us, OPTIMIZED_CYCLE_TIME_US);
+    printf("Communication errors: %lu\n", servo_state.communication_errors);
+    printf("Current: Position=%.1f counts, Velocity=%.1f °/s\n",
+           servo_state.current_position, servo_state.current_velocity);
+}
+
+// Clean shutdown
+void soem_interface_stop_optimized(void) {
+    if (servo_thread_running) {
+        printf("SOEM: Stopping optimized servo control...\n");
+        
+        // Stop torque output safely
+        servo_state.target_torque = 0.0f;
+        usleep(10000); // Allow servo to process zero torque
+        
+        // Stop thread
+        servo_thread_running = 0;
+        pthread_join(servo_thread, NULL);
+        
+        // Safe EtherCAT shutdown
+        if (servo_outputs) {
+            servo_outputs->target_torque = 0;
+            servo_outputs->controlword = 0x0006; // Shutdown
+        }
+        ec_send_processdata();
+        
+        soem_interface_set_ethercat_state(0, EC_STATE_INIT);
+        ec_close();
+        
+        // Print final performance report
+        soem_interface_print_performance_stats();
+        
+        printf("SOEM: Optimized servo control stopped safely\n");
+    }
+}

@@ -24,7 +24,7 @@
 // Configuration constants
 #define MAIN_LOOP_FREQUENCY_HZ 100  // 100 Hz (10ms cycle time)
 #define CYCLE_TIME_NS (1000000000L / MAIN_LOOP_FREQUENCY_HZ)
-#define MAX_STEERING_ANGLE 540.0f  // ±540 degrees (3 full turns)
+#define MAX_STEERING_ANGLE 1080.0f  // ±540 degrees (3 full turns)
 #define MAX_TORQUE_LIMIT 5000.0f   // Maximum torque in appropriate units
 #define STATS_PRINT_INTERVAL 100   // Print stats every 100 loops (1 second at 100Hz)
 #define MAX_LATE_WARNINGS 20       // Reduced warnings

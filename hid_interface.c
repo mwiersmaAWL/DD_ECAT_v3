@@ -21,7 +21,7 @@
 // Optimized send interval for better USB performance
 #define HID_SEND_INTERVAL_MS 10  // Send reports every 10ms (100Hz)
 #define USB_RECONNECT_DELAY_MS 1000  // Wait 1 second before trying to reconnect
-#define MAX_STEERING_ANGLE 540.0f // Adjusted to 540 degrees as per main.c
+#define MAX_STEERING_ANGLE 1080.0f // Adjusted to 540 degrees as per main.c
 
 // Reduced retries and timeouts for better performance
 #define MAX_WRITE_RETRIES 2
