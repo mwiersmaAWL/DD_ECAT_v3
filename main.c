@@ -322,7 +322,6 @@ void enable_raw_mode() {
     
     struct termios raw = orig_termios;
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= ~(OPOST);
     raw.c_cflag |= (CS8);
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
     raw.c_cc[VMIN] = 0;
@@ -620,12 +619,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to initialize HID interface.\n");
         cleanup_and_exit(EXIT_FAILURE);
     }
-
+    /*
     if (hid_interface_start() != 0) {
         fprintf(stderr, "Failed to start HID interface.\n");
         cleanup_and_exit(EXIT_FAILURE);
     }
-    
+    */
     // --- Main Control Loop ---
     printf("\n=== Starting Main Control Loop ===\n");
     printf("Loop frequency: %d Hz (target cycle time: %.1f ms)\n", 

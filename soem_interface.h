@@ -229,7 +229,7 @@ int is_slave_operational(int slave_idx);
  * @param state The EtherCAT state value.
  * @return A string representation of the state.
  */
-const char* get_state_name(uint16 state);
+const char* get_state_name(uint16_t state);
 
 /**
  * @brief Initializes CiA 402 parameters for a specific slave.

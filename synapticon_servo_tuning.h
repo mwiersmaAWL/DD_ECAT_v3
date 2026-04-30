@@ -10,6 +10,9 @@
 #define SYNAPTICON_ENCODER_BITS 16           // Bit resolution
 #define DEGREES_PER_COUNT (360.0f / SYNAPTICON_ENCODER_RESOLUTION)
 
+// Steering range
+#define MAX_STEERING_ANGLE 1080.0f  // ±540 degrees (3 full turns)
+
 // Synapticon servo tuning parameters structure
 typedef struct {
     // Motion control parameters
