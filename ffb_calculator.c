@@ -171,3 +171,11 @@ float ffb_calculator_calculate_torque(const ffb_motor_effect_t *effect, float cu
 
     return desired_torque;
 }
+
+// Stub implementation: ffb_calculator_v2.c has a full version with counters.
+// This stub satisfies the declaration for builds using ffb_calculator.c.
+void ffb_calculator_get_stats(uint32_t *calc_count, uint32_t *effect_changes, float *last_torque) {
+    if (calc_count)   *calc_count    = 0;
+    if (effect_changes) *effect_changes = 0;
+    if (last_torque)  *last_torque   = 0.0f;
+}

@@ -76,11 +76,13 @@ static inline uint32_t get_current_time_ms(void) {
 
 // Fast math approximations for periodic effects
 static inline float fast_sin(float x) {
-    // Normalize to [-PI, PI]
-    while (x > M_PI) x -= TWO_PI;
-    while (x < -M_PI) x += TWO_PI;
-    
-    // Taylor series approximation (good for performance)
+    // Bug fix: while-loop normalization is O(n) for large x (e.g. high freq * long runtime).
+    // Use fmodf for O(1) normalization regardless of magnitude.
+    x = fmodf(x, TWO_PI);
+    if (x > M_PI) x -= TWO_PI;
+    else if (x < -M_PI) x += TWO_PI;
+
+    // Taylor series approximation (good for performance, accurate within [-PI, PI])
     float x2 = x * x;
     return x * (1.0f - x2 * (1.0f/6.0f - x2 * (1.0f/120.0f)));
 }

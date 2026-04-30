@@ -8,6 +8,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <time.h>
+#include <errno.h>
 
 // --- SOEM Library Includes ---
 #include "ethercat.h"  
@@ -37,9 +38,12 @@
 #define CIA402_CONTROLWORD_EO           0x0008  // Enable operation
 #define CIA402_CONTROLWORD_FAULT_RESET  0x0080  // Fault reset
 
-// **SYNAPTICON 14-BIT ENCODER CONFIGURATION**
-// 14-bit absolute encoder = 16,384 counts per revolution
-#define ENCODER_COUNTS_PER_REV          16384.0f // 2^14 counts per revolution
+// **SYNAPTICON 16-BIT ENCODER CONFIGURATION** (matches main.c and synapticon_servo_tuning.h)
+// 16-bit absolute encoder = 65,536 counts per revolution
+#define ENCODER_COUNTS_PER_REV          65536.0f // 2^16 counts per revolution
+
+// Scale factor: FFB calculator outputs [-5000, +5000]; CiA402 target_torque is per-mille [-1000, +1000]
+#define TORQUE_PERMILLE_SCALE           (1000.0f / 5000.0f)
 
 // --- SOEM Global Variables ---
 char IOmap[4096];
@@ -49,8 +53,8 @@ ec_groupt DCgroup;
 int wkc;
 int expectedWKC;
 ec_timet tmo;
-// Cycle time matches main loop (100Hz = 10ms)
-int cycle_time = 10000; // 10 ms in microseconds
+// Cycle time matches main loop (1kHz = 1ms, see main_v2.c MAIN_LOOP_FREQUENCY_HZ)
+int cycle_time = 1000; // 1 ms in microseconds
 
 // Use minimal essential mapping to avoid size issues
 uint32_t rxpdo_mapping[] = {
@@ -63,13 +67,14 @@ uint32_t rxpdo_mapping[] = {
 uint32_t txpdo_mapping[] = {
     0x60410010,  // Statusword (16-bit)
     0x60610008,  // Modes of operation display (8-bit)
-    0x60640020,  // Position actual value (32-bit) - This gives us the 14-bit encoder data
+    0x60640020,  // Position actual value (32-bit)
+    0x606C0020,  // Velocity actual value (32-bit) — was missing, caused somanet_tx_pdo_enhanced_t misalignment
     0x60770010   // Torque actual value (16-bit)
     };
     
     // Calculate and verify sizes
     uint16_t rxpdo_size_bits = 16 + 8 + 16 + 32; // 72 bits = 9 bytes
-    uint16_t txpdo_size_bits = 16 + 8 + 32 + 16; // 72 bits = 9 bytes
+    uint16_t txpdo_size_bits = 16 + 8 + 32 + 32 + 16; // 104 bits = 13 bytes
 
 // Pointers to the PDO data in the IOmap
 somanet_rx_pdo_enhanced_t *somanet_outputs; 
@@ -428,7 +433,7 @@ void *ecat_loop(void *ptr) {
     int slave_idx = 1;
     int state_machine_initialized = 0;
 
-    printf("SOEM_Interface: EtherCAT thread started (10ms cycle time).\n");
+    printf("SOEM_Interface: EtherCAT thread started (%d µs cycle time).\n", cycle_time);
 
     while (!master_initialized && ecat_thread_running) {
         usleep(10000); // Wait for master to be initialized
@@ -441,18 +446,26 @@ void *ecat_loop(void *ptr) {
 
     printf("SOEM_Interface: Entering EtherCAT cyclic loop.\n");
 
-    struct timespec loop_start, loop_end;
-    long elapsed_ns;
+    // Use absolute-time sleeping to prevent cumulative drift from relative nanosleep
+    struct timespec next_wakeup;
+    clock_gettime(CLOCK_MONOTONIC, &next_wakeup);
 
     while (ecat_thread_running) {
-        clock_gettime(CLOCK_MONOTONIC, &loop_start);
+        // Advance absolute deadline at the top of the loop
+        next_wakeup.tv_nsec += (long)cycle_time * 1000L;
+        if (next_wakeup.tv_nsec >= 1000000000L) {
+            next_wakeup.tv_sec++;
+            next_wakeup.tv_nsec -= 1000000000L;
+        }
 
         // Update output PDO data
         pthread_mutex_lock(&pdo_mutex);
         if (somanet_outputs) {
             // Only update torque if we're in operational state
             if (current_cia402_state == CIA402_STATE_OPERATION_ENABLED) {
-                somanet_outputs->target_torque = (int16_t)(target_torque_f * 1000.0f);
+                // Bug fix: FFB outputs [-5000,+5000]; CiA402 target_torque is per-mille [-1000,+1000]
+                // Previous code multiplied by 1000 causing int16_t overflow at any FFB value > 32
+                somanet_outputs->target_torque = (int16_t)(target_torque_f * TORQUE_PERMILLE_SCALE);
             } else {
                 somanet_outputs->target_torque = 0; // Safe value
             }
@@ -512,22 +525,19 @@ void *ecat_loop(void *ptr) {
             ec_statecheck(slave_idx, EC_STATE_OPERATIONAL, 100000);
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &loop_end);
-        elapsed_ns = (loop_end.tv_sec - loop_start.tv_sec) * 1000000000L + (loop_end.tv_nsec - loop_start.tv_nsec);
-        long sleep_ns = cycle_time * 1000L - elapsed_ns; // cycle_time is in microseconds
-
-        if (sleep_ns > 0) {
-            struct timespec sleep_time = {
-                .tv_sec = sleep_ns / 1000000000L,
-                .tv_nsec = sleep_ns % 1000000000L
-            };
-            nanosleep(&sleep_time, NULL);
-        } else {
-            // EtherCAT thread running late
+        // Sleep until absolute deadline — prevents accumulated drift from relative nanosleep
+        int sleep_ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wakeup, NULL);
+        if (sleep_ret != 0 && sleep_ret != EINTR) {
             static int late_warnings = 0;
             if (late_warnings < 10) {
-                printf("SOEM_Interface: EtherCAT thread running %.3fms late\n", -sleep_ns / 1000000.0);
-                late_warnings++;
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long behind_ns = (now.tv_sec - next_wakeup.tv_sec) * 1000000000L +
+                                 (now.tv_nsec - next_wakeup.tv_nsec);
+                if (behind_ns > 0) {
+                    printf("SOEM_Interface: EtherCAT thread running %.3fms late\n", behind_ns / 1000000.0);
+                    late_warnings++;
+                }
             }
         }
     }

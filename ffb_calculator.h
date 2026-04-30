@@ -11,6 +11,12 @@ float ffb_calculator_get_torque(void);
 void ffb_calculator_set_gains(float spring_gain, float damper_gain, float inertia_gain);
 
 /**
+ * @brief Returns diagnostic statistics from the FFB calculator.
+ * Used by main_v2.c for performance monitoring.
+ */
+void ffb_calculator_get_stats(uint32_t *calc_count, uint32_t *effect_changes, float *last_torque);
+
+/**
  * @brief Initializes the FFB calculator.
  */
 void ffb_calculator_init();

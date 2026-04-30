@@ -34,11 +34,23 @@ LDFLAGS = -lrt -lpthread -lm -lsoem -L/home/mwi/SOEM/install/lib
 
 # --- Project Files ---
 TARGET = ffb_app
-SRCS = main.c ffb_calculator.c hid_interface.c soem_interface.c
-# Add new source file when you create it:
+# Use ffb_calculator_v2.c — includes ffb_calculator_get_stats required by main_v2.c
+SRCS = main.c ffb_calculator_v2.c hid_interface.c soem_interface.c
 SRCS += synapticon_servo_tuning.c
 
 OBJS = $(SRCS:.c=.o) # Automatically generate .o file names from .c file names
+
+# ---------------------------------------------------------------------------
+# Simulation build — no SOEM needed, runs on any Linux x86/x64 machine
+# Replace soem_interface.c with soem_interface_sim.c and add -DSIM_MODE.
+# ---------------------------------------------------------------------------
+TARGET_SIM = ffb_sim
+SRCS_SIM   = main.c ffb_calculator_v2.c hid_interface.c soem_interface_sim.c
+SRCS_SIM  += synapticon_servo_tuning.c
+OBJS_SIM   = $(SRCS_SIM:.c=.sim.o)
+
+CFLAGS_SIM = -Wall -Wextra -g -std=c11 -D_GNU_SOURCE -DSIM_MODE -O2
+LDFLAGS_SIM = -lrt -lpthread -lm
 
 # --- Rules ---
 
@@ -59,6 +71,20 @@ $(TARGET): $(OBJS)
 	@echo "Compiling $< with optimizations..."
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Simulation build: separate .sim.o objects to avoid conflicts with real build
+%.sim.o: %.c
+	@echo "Compiling $< for simulation..."
+	$(CC) $(CFLAGS_SIM) -c $< -o $@
+
+sim: $(OBJS_SIM)
+	@echo "Linking simulation build $(TARGET_SIM)..."
+	$(CC) $(OBJS_SIM) -o $(TARGET_SIM) $(LDFLAGS_SIM)
+	@echo ""
+	@echo "Simulation build complete: ./$(TARGET_SIM)"
+	@echo "Run with:  sudo ./$(TARGET_SIM) <any_interface_name>"
+	@echo "The HID gadget (/dev/hidg0) still needs to be active."
+	@echo "To test FFB calculations without HID: comment out hid_interface_start() in main.c"
+
 # Debug build target (without aggressive optimizations)
 debug: CFLAGS = -Wall -Wextra -g -std=c11 -O0 -D_GNU_SOURCE -I/home/mwi/SOEM/install/include/soem -DDEBUG_BUILD
 debug: $(TARGET)
@@ -67,7 +93,7 @@ debug: $(TARGET)
 # Clean rule: removes all generated object files and the executable
 clean:
 	@echo "Cleaning up..."
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(OBJS_SIM) $(TARGET) $(TARGET_SIM)
 	@echo "Clean complete."
 
 # Install rule (optional): copy executable to system location
@@ -89,6 +115,12 @@ info:
 	@echo "LDFLAGS: $(LDFLAGS)"
 	@echo "Target: $(TARGET)"
 	@echo "Sources: $(SRCS)"
+	@echo ""
+	@echo "--- Simulation build ---"
+	@echo "CFLAGS_SIM: $(CFLAGS_SIM)"
+	@echo "LDFLAGS_SIM: $(LDFLAGS_SIM)"
+	@echo "Target: $(TARGET_SIM)"
+	@echo "Sources: $(SRCS_SIM)"
 
 # Phony targets: tell make that these are not actual files 
-.PHONY: all clean debug install test-performance info
+.PHONY: all clean debug install test-performance info sim

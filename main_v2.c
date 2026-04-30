@@ -135,8 +135,12 @@ static int apply_safety_checks_optimized(app_state_t *state) {
     // Fast emergency recovery
     if (emergency_stop && fabsf(state->desired_torque) < MAX_TORQUE_LIMIT * 0.2f && torque_rate < 100.0f) {
         static struct timespec emergency_start_time = {0};
-        if (emergency_start_time.tv_sec == 0) {
+        // Bug fix: tv_sec==0 is not a safe sentinel (CLOCK_MONOTONIC can start near 0).
+        // Use a separate flag instead.
+        static int emergency_timer_active = 0;
+        if (!emergency_timer_active) {
             clock_gettime(CLOCK_MONOTONIC, &emergency_start_time);
+            emergency_timer_active = 1;
         }
         
         struct timespec current_time;
@@ -146,7 +150,7 @@ static int apply_safety_checks_optimized(app_state_t *state) {
         
         if (elapsed_ms > EMERGENCY_RECOVERY_TIME_MS) {
             emergency_stop = 0;
-            emergency_start_time.tv_sec = 0;
+            emergency_timer_active = 0;
             printf("Emergency stop cleared after %ld ms\n", elapsed_ms);
         }
     }
@@ -234,14 +238,17 @@ static void print_servo_performance_stats(const performance_stats_t *stats) {
            stats->min_time_ns / 1000000.0, stats->max_time_ns / 1000000.0, avg_time_ns / 1000000.0);
     printf("Position: Current=%.1f°, Velocity=%.1f°/s (filtered)\n",
            pos_tracker.position_filtered / ENCODER_COUNTS_PER_REV * 360.0f, pos_tracker.velocity_filtered);
-    printf("Torque: Current=%.1f, Avg=%.1f, Max=%.1f, Rate-limited=%s\n",
-           pos_tracker.velocity_filtered, stats->avg_torque, stats->max_torque,
-           (avg_time_ns < CYCLE_TIME_NS * 0.9f) ? "No" : "Yes");
-    
-    // FFB Calculator stats
+
+    // FFB Calculator stats — get last_torque first so it can be used in the torque print below
     uint32_t calc_count, effect_changes;
     float last_torque;
     ffb_calculator_get_stats(&calc_count, &effect_changes, &last_torque);
+
+    printf("Torque: Current=%.1f, Avg=%.1f, Max=%.1f, Rate-limited=%s\n",
+           last_torque, stats->avg_torque, stats->max_torque,
+           (avg_time_ns < CYCLE_TIME_NS * 0.9f) ? "No" : "Yes");
+    
+    // FFB Calculator stats
     printf("FFB Calculator: %u calculations, %u effect changes, last torque=%.1f\n",
            calc_count, effect_changes, last_torque);
     
