@@ -149,7 +149,7 @@ sudo reboot
 #### Phase 5: Compile all files
 
 - cd DD_ECAT_v3
-- make
+- make -f Makefile_v2
 - If correctly installed:
 - sudo ./ffb_app eth1
 
@@ -162,4 +162,134 @@ sudo reboot
 - // Add after soem_interface_init_enhanced():
 - configure_synapticon_for_steering_wheel(1);
 - print_synapticon_status(1);
+
+---
+
+## Simulation mode — no Raspberry Pi or Synapticon motor needed
+
+If you don't have a Raspberry Pi or a Synapticon servo motor available, you can run the full software stack on any Linux PC (x86/x64) using the built-in simulation mode.
+
+The simulation replaces the real EtherCAT/SOEM layer (`soem_interface.c`) with a software motor model (`soem_interface_sim.c`). The rest of the stack — FFB calculator, HID interface, safety checks, logging — runs completely unchanged.
+
+**What the simulation models:**
+- 1-DOF rotational system: `I·α = torque - b·ω`
+- Moment of inertia, viscous damping, and rated torque are configurable constants at the top of `soem_interface_sim.c`
+- Soft virtual end-stops at ±540° (matching the real steering range)
+- Encoder position reported in 65 536 counts/revolution (same as the real 16-bit Synapticon encoder)
+- Always reports `CIA402_STATE_OPERATION_ENABLED` so the control loop starts immediately
+
+---
+
+### Prerequisites (Linux PC)
+
+You need a standard Linux desktop or VM with:
+
+```bash
+sudo apt install build-essential gcc libpthread-stubs0-dev
+# librt and libm are part of glibc and are always available
+```
+
+No SOEM, no EtherCAT drivers, no special kernel needed.
+
+---
+
+### Step 1 — Build the simulation binary
+
+From the project directory:
+
+```bash
+make -f Makefile_v2 sim
+```
+
+This produces `./ffb_sim`. It uses `-DSIM_MODE` which replaces the SOEM include with a stub, so no EtherCAT library is required.
+
+---
+
+### Step 2 — Set up the USB HID gadget (optional)
+
+The HID interface writes to `/dev/hidg0`. On a PC that file does not exist unless you configure a USB OTG gadget.
+
+**Option A — Skip HID, test FFB calculations only**
+
+If you only want to verify the FFB physics and logging, comment out the HID start call in `main.c`:
+
+```c
+// hid_interface_start();   // comment out for headless simulation
+```
+
+Rebuild with `make -f Makefile_v2 sim`. The simulation will run, log to a CSV file, and print position/velocity/torque to the terminal. No USB connection needed.
+
+**Option B — Full HID test with a second Linux machine**
+
+1. On the PC that runs `ffb_sim`, install the `libcomposite` gadget using the same `create_ffb_gadget.sh` script from the repo (requires a board with USB OTG support, such as a Pi, or a VM with USB passthrough).
+2. Connect via USB to a Windows PC. The device will appear as a joystick in Windows Game Controllers and accept FFB commands from any DirectInput game.
+
+---
+
+### Step 3 — Run the simulation
+
+```bash
+sudo ./ffb_sim sim_eth0
+```
+
+The interface name argument is ignored in simulation mode — you can pass any string.
+
+`sudo` is needed for:
+- `SCHED_FIFO` real-time scheduling (`mlockall` in `setup_real_time_scheduling`)
+- Writing to `/dev/hidg0` if HID is active
+
+Expected startup output:
+
+```
+=== Raspberry Pi FFB Steering Wheel Application ===
+Synapticon 16-bit Absolute Encoder Version with FFB Logging
+...
+SIM: soem_interface_init_enhanced() — simulation mode, no real hardware
+SIM: Motor model: I=0.050 kg*m^2, b=2.0 Nms/rad, rated=10.0 Nm
+SIM: Encoder: 65536 counts/rev, steering limit ±540°
+SIM: Physics thread started at 1000 Hz
+SIM: Initialisation complete — simulation running
+...
+Starting optimized servo control loop at 1000 Hz...
+Status: Deg=0.0° (0.000 rev), Vel=0.0°/s, Torque=0.0, EtherCAT=OK, HID=...
+```
+
+---
+
+### Step 4 — Tune the simulation parameters
+
+Open `soem_interface_sim.c` and adjust the constants at the top to match your actual hardware:
+
+| Constant | Default | Description |
+|---|---|---|
+| `SIM_INERTIA` | `0.05` | Moment of inertia in kg·m². Increase for a heavier wheel. |
+| `SIM_DAMPING` | `2.0` | Viscous damping in Nms/rad. Increase for more resistance. |
+| `SIM_RATED_TORQUE_NM` | `10.0` | Motor rated torque in Nm (1000 per-mille = this value). |
+| `SIM_MAX_ANGLE_DEG` | `540.0` | Steering lock-to-lock half-angle in degrees. |
+| `SIM_STOP_STIFFNESS` | `50.0` | Spring stiffness of virtual end-stops in Nm/rad. |
+
+After changing, rebuild with `make -f Makefile_v2 sim`.
+
+---
+
+### Step 5 — Read the log file
+
+Every run creates a timestamped CSV log file in the current directory (e.g. `ffb_log_20260430_143000.csv`). Open it in Excel, LibreOffice Calc, or Python/pandas to inspect:
+
+- Wheel position and velocity over time
+- Every FFB effect the game sent (type, magnitude, coefficients)
+- Calculated torque output
+- Emergency stop events
+
+Use `Ctrl+L` while running to toggle logging on/off, and `Ctrl+R` to recenter the wheel position.
+
+---
+
+### Keyboard controls (both simulation and real hardware)
+
+| Key | Action |
+|---|---|
+| `Ctrl+C` | Graceful shutdown |
+| `Ctrl+R` | Recenter wheel (set current position as new zero) |
+| `Ctrl+L` | Toggle CSV logging on/off |
 

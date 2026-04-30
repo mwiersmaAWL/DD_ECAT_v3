@@ -105,7 +105,7 @@ static int check_hid_device_exists() {
     return S_ISCHR(st.st_mode);
 }
 
-// Safe function to close HID device
+// Safe function to close HID device (acquires mutex itself, use from OUTSIDE locked sections)
 static void safe_close_hid_device() {
     pthread_mutex_lock(&hidg_fd_mutex);
     if (hidg_fd >= 0) {
@@ -115,6 +115,16 @@ static void safe_close_hid_device() {
         printf("HIDInterface: Closed HID device\n");
     }
     pthread_mutex_unlock(&hidg_fd_mutex);
+}
+
+// Internal close: call ONLY while hidg_fd_mutex is already held to avoid deadlock
+static void _close_hid_device_nolock(void) {
+    if (hidg_fd >= 0) {
+        close(hidg_fd);
+        hidg_fd = -1;
+        usb_connected = 0;
+        printf("HIDInterface: Closed HID device\n");
+    }
 }
 
 // Attempt to open/reopen HID device
@@ -252,7 +262,9 @@ static void* _usb_ffb_reception_thread(void* arg) {
                     read_failures++;
                     total_read_errors++;
                     if (read_failures > 10) {
-                        safe_close_hid_device();
+                        // Bug fix: safe_close_hid_device() takes the mutex — deadlock here.
+                        // Use nolock variant since hidg_fd_mutex is already held.
+                        _close_hid_device_nolock();
                         read_failures = 0;
                     }
                 } else if (retval) {
@@ -277,7 +289,8 @@ static void* _usb_ffb_reception_thread(void* arg) {
                             read_failures++;
                             total_read_errors++;
                             if (read_failures > 10) {
-                                safe_close_hid_device();
+                                // Bug fix: deadlock — use nolock variant
+                                _close_hid_device_nolock();
                                 read_failures = 0;
                             }
                         }
@@ -299,10 +312,11 @@ static void* _usb_ffb_reception_thread(void* arg) {
 static void* _gamepad_report_loop(void* arg) {
     (void)arg;
 
-    // Set CPU affinity for this thread to core 1
+    // Bug fix: both threads were pinned to core 1, competing for the same CPU.
+    // Assign gamepad thread to core 2, FFB reception thread stays on core 1.
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(1, &cpuset);
+    CPU_SET(2, &cpuset);
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
         perror("Gamepad Report Thread: Failed to set CPU affinity");
     }
@@ -486,7 +500,9 @@ int hid_interface_send_gamepad_report(float normalized_position, unsigned int bu
         consecutive_write_failures++;
         total_write_errors++;
         if (consecutive_write_failures > 5) {
-            safe_close_hid_device();
+            // Bug fix: safe_close_hid_device() takes the mutex — deadlock here.
+            // Use nolock variant since hidg_fd_mutex is already held.
+            _close_hid_device_nolock();
             pthread_mutex_unlock(&hidg_fd_mutex);
             return -1;
         }
@@ -513,7 +529,8 @@ int hid_interface_send_gamepad_report(float normalized_position, unsigned int bu
             } else if (errno == EBADF || errno == ENODEV || errno == EPIPE) {
                 // Critical error: device lost
                 perror("HIDInterface: Critical write error (device lost)");
-                safe_close_hid_device();
+                // Bug fix: safe_close_hid_device() takes the mutex — deadlock here.
+                _close_hid_device_nolock();
                 pthread_mutex_unlock(&hidg_fd_mutex);
                 return -1;
             } else {

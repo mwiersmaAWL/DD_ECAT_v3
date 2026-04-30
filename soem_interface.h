@@ -3,7 +3,18 @@
 #define SOEM_INTERFACE_H
 
 #include <stdint.h>
+
+// Allow building without SOEM installed (simulation mode)
+#ifndef SIM_MODE
 #include "ethercat.h" // Include for ec_state
+#else
+typedef int ec_state;  // Stub for simulation builds
+#endif
+
+// Ensure PACKED is defined (soem_interface.h is self-contained)
+#ifndef PACKED
+#define PACKED __attribute__((__packed__))
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -218,7 +229,7 @@ int is_slave_operational(int slave_idx);
  * @param state The EtherCAT state value.
  * @return A string representation of the state.
  */
-const char* get_state_name(uint16 state);
+const char* get_state_name(uint16_t state);
 
 /**
  * @brief Initializes CiA 402 parameters for a specific slave.

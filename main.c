@@ -187,6 +187,10 @@ int check_ctrl_combinations() {
     char ch;
     if (read(STDIN_FILENO, &ch, 1) == 1) {
         switch (ch) {
+            case 3:  // Ctrl+C (disabled by raw mode ISIG flag, handle manually)
+                printf("Ctrl+C pressed - initiating graceful shutdown!\n");
+                running = 0;
+                return 1;
             case 18: // Ctrl+R
                 printf("Ctrl+R pressed - recentering wheel!\n");
                 // Recenter using our centralized system
@@ -318,7 +322,6 @@ void enable_raw_mode() {
     
     struct termios raw = orig_termios;
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= ~(OPOST);
     raw.c_cflag |= (CS8);
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
     raw.c_cc[VMIN] = 0;
@@ -509,14 +512,24 @@ static int apply_safety_checks(app_state_t *state) {
     }
     
     // Check for communication loss
+    // Bug fix: counter was reset to 0 on detection, allowing non-zero torque for the
+    // next 100 cycles. Now: keep torque at zero until comms is confirmed restored.
+    static int comm_loss_count = 0;
+    static int comm_loss_logged = 0;
     if (!state->ethercat_status) {
-        static int comm_loss_count = 0;
-        if (++comm_loss_count > 100) { // 1 second without communication at 100Hz
-            printf("SAFETY: EtherCAT communication lost, setting zero torque\n");
+        comm_loss_count++;
+        if (comm_loss_count > 100) {
+            if (!comm_loss_logged) {
+                printf("SAFETY: EtherCAT communication lost, setting zero torque\n");
+                comm_loss_logged = 1;
+                state->stats.communication_errors++;
+            }
             state->desired_torque = 0.0f;
-            comm_loss_count = 0;
             return 1;
         }
+    } else {
+        comm_loss_count = 0;
+        comm_loss_logged = 0;
     }
     
     // Apply torque limits
@@ -606,12 +619,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to initialize HID interface.\n");
         cleanup_and_exit(EXIT_FAILURE);
     }
-
+    /*
     if (hid_interface_start() != 0) {
         fprintf(stderr, "Failed to start HID interface.\n");
         cleanup_and_exit(EXIT_FAILURE);
     }
-    
+    */
     // --- Main Control Loop ---
     printf("\n=== Starting Main Control Loop ===\n");
     printf("Loop frequency: %d Hz (target cycle time: %.1f ms)\n", 
