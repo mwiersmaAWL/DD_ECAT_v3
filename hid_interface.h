@@ -4,6 +4,9 @@
 
 #include "ffb_types.h"
 
+/* Maximum number of concurrent USB PID effect slots (indexed by effect block index). */
+#define FFB_EFFECT_SLOTS 16
+
 // Global running flag
 extern volatile int hid_running;
 
@@ -12,6 +15,7 @@ int hid_interface_init();
 int hid_interface_start();
 void hid_interface_stop();
 int hid_interface_get_ffb_effect(ffb_motor_effect_t *effect_out);
+int hid_interface_get_active_effects(ffb_motor_effect_t *effect_array, int max_count);
 int hid_interface_send_gamepad_report(float position, unsigned int buttons);
 //void hid_interface_send_gamepad_report(float position, unsigned int buttons);
 float hid_interface_get_relative_position(void);

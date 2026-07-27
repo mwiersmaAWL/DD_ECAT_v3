@@ -58,14 +58,19 @@ typedef struct {
     uint8_t data[16];  // Maximum data size based on your largest report
 } __attribute__((packed)) ffb_generic_report_t;
 
-// FFB Effect Queue
-#define FFB_EFFECT_QUEUE_SIZE 16
-static ffb_motor_effect_t ffb_effect_queue[FFB_EFFECT_QUEUE_SIZE];
-static int queue_head = 0;
-static int queue_tail = 0;
-static int queue_count = 0;
-static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+// FFB Effect Slot Table — persistent storage keyed by USB PID effect block index.
+// Each slot lives until explicitly stopped or its duration elapses, replacing the
+// single-cycle queue that caused all effects to die after one loop iteration.
+typedef struct {
+    ffb_motor_effect_t effect;
+    int occupied;           /* 1 once a Set Effect report has populated this slot */
+    int running;            /* 1 while the effect is currently active */
+    struct timespec start_time; /* CLOCK_MONOTONIC timestamp when the effect started running */
+} effect_slot_t;
+
+static effect_slot_t effect_slots[FFB_EFFECT_SLOTS];
+static int last_block_index = 0; /* 0-based index of the most recently referenced slot */
+static pthread_mutex_t slot_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Thread running flag
 volatile int hid_running = 0;
@@ -179,6 +184,33 @@ static int should_attempt_reconnect() {
     return 1;
 }
 
+/**
+ * @brief Maps a raw USB HID PID effect-type usage value to the internal enum.
+ *
+ * Args:
+ *     raw: Effect type byte from the HID report (USB HID Usage Tables, PID section).
+ *
+ * Returns:
+ *     Corresponding ffb_effect_type_t; falls back to FFB_EFFECT_CONSTANT_FORCE for
+ *     unknown values so the effect is always reachable rather than silently lost.
+ */
+static ffb_effect_type_t map_raw_effect_type(uint8_t raw) {
+    switch (raw) {
+        case 0x01: return FFB_EFFECT_CONSTANT_FORCE;
+        case 0x02: return FFB_EFFECT_RAMP;
+        case 0x03: /* square   — fall-through */
+        case 0x04: /* sine     — fall-through */
+        case 0x05: /* triangle — fall-through */
+        case 0x06: /* saw-up   — fall-through */
+        case 0x07: return FFB_EFFECT_PERIODIC; /* saw-down */
+        case 0x08: return FFB_EFFECT_SPRING;
+        case 0x09: return FFB_EFFECT_DAMPER;
+        case 0x0A: return FFB_EFFECT_INERTIA;
+        case 0x0B: return FFB_EFFECT_FRICTION;
+        default:   return FFB_EFFECT_CONSTANT_FORCE;
+    }
+}
+
 // Updated parse FFB reports from PC with proper structure handling
 static int parse_ffb_report(uint8_t *report, size_t len, ffb_motor_effect_t *effect) {
     if (len < 2) return 0;
@@ -191,10 +223,11 @@ static int parse_ffb_report(uint8_t *report, size_t len, ffb_motor_effect_t *eff
     clock_gettime(CLOCK_REALTIME, &effect->received_time);
     
     switch (report_id) {
-        case 2: // PID Pool Report
+        case 2: // PID Pool Report — defines effect type for a block index
             if (len >= sizeof(ffb_pid_pool_report_t)) {
                 ffb_pid_pool_report_t *pid_report = (ffb_pid_pool_report_t *)report;
                 effect->effect_type = pid_report->effect_type;
+                effect->type        = map_raw_effect_type(pid_report->effect_type);
                 return 1;
             }
             break;
@@ -274,14 +307,34 @@ static void* _usb_ffb_reception_thread(void* arg) {
                         
                         ffb_motor_effect_t new_effect;
                         if (parse_ffb_report((uint8_t*)&ffb_report, (size_t)len, &new_effect)) {
-                            pthread_mutex_lock(&queue_mutex);
-                            if (queue_count < FFB_EFFECT_QUEUE_SIZE) {
-                                ffb_effect_queue[queue_tail] = new_effect;
-                                queue_tail = (queue_tail + 1) % FFB_EFFECT_QUEUE_SIZE;
-                                queue_count++;
-                                pthread_cond_signal(&queue_cond);
+                            /* Determine which slot to update.  Report 2 carries an explicit
+                             * effect block index in byte 1 (ffb_pid_pool_report_t layout).
+                             * All other reports update the most recently referenced slot. */
+                            int block_idx = last_block_index;
+                            if (new_effect.report_id == 2) {
+                                /* ffb_report.data[0] == effect_block_index */
+                                block_idx = (int)(ffb_report.data[0] % FFB_EFFECT_SLOTS);
+                                last_block_index = block_idx;
                             }
-                            pthread_mutex_unlock(&queue_mutex);
+
+                            pthread_mutex_lock(&slot_mutex);
+                            effect_slot_t *slot = &effect_slots[block_idx];
+                            if (new_effect.report_id == 2) {
+                                /* New effect: initialise or overwrite the slot */
+                                slot->effect   = new_effect;
+                                slot->occupied = 1;
+                                slot->running  = 1;
+                                clock_gettime(CLOCK_MONOTONIC, &slot->start_time);
+                            } else if (slot->occupied) {
+                                /* Parameter update: merge into existing slot, preserve type */
+                                ffb_effect_type_t saved_type = slot->effect.type;
+                                slot->effect.magnitude   = new_effect.magnitude;
+                                slot->effect.duration_ms = new_effect.duration_ms;
+                                slot->effect.type        = saved_type;
+                                slot->running = 1;
+                                clock_gettime(CLOCK_MONOTONIC, &slot->start_time);
+                            }
+                            pthread_mutex_unlock(&slot_mutex);
                         }
                     } else if (len < 0) {
                         if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -414,19 +467,58 @@ void hid_interface_stop() {
 }
 
 /**
- * @brief Retrieves the latest FFB effect from the queue.
+ * @brief Returns all currently running effects from the persistent slot table.
+ *
+ * Effects that have exceeded their duration_ms are automatically expired.
+ * Effects with duration_ms == 0 run indefinitely until overwritten.
+ *
+ * Args:
+ *     effect_array: Buffer to receive the active effect copies.
+ *     max_count:    Maximum number of entries to write.
+ *
+ * Returns:
+ *     Number of active effects written to effect_array.
+ */
+int hid_interface_get_active_effects(ffb_motor_effect_t *effect_array, int max_count) {
+    int count = 0;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    pthread_mutex_lock(&slot_mutex);
+    for (int i = 0; i < FFB_EFFECT_SLOTS && count < max_count; i++) {
+        effect_slot_t *slot = &effect_slots[i];
+        if (!slot->occupied || !slot->running) continue;
+
+        /* Expire timed effects whose duration has elapsed */
+        if (slot->effect.duration_ms > 0) {
+            long elapsed_ms = (now.tv_sec  - slot->start_time.tv_sec)  * 1000L +
+                              (now.tv_nsec - slot->start_time.tv_nsec) / 1000000L;
+            if (elapsed_ms >= (long)slot->effect.duration_ms) {
+                slot->running = 0;
+                continue;
+            }
+        }
+
+        effect_array[count++] = slot->effect;
+    }
+    pthread_mutex_unlock(&slot_mutex);
+    return count;
+}
+
+/**
+ * @brief Retrieves the latest FFB effect from the slot table (convenience wrapper).
+ *
+ * Returns the first active effect found.  Prefer hid_interface_get_active_effects()
+ * when the caller needs to handle multiple simultaneous effects.
+ *
+ * Args:
+ *     effect_out: Pointer to receive the effect data.
+ *
+ * Returns:
+ *     1 if an active effect was found, 0 otherwise.
  */
 int hid_interface_get_ffb_effect(ffb_motor_effect_t *effect_out) {
-    pthread_mutex_lock(&queue_mutex);
-    if (queue_count > 0) {
-        *effect_out = ffb_effect_queue[queue_head];
-        queue_head = (queue_head + 1) % FFB_EFFECT_QUEUE_SIZE;
-        queue_count--;
-        pthread_mutex_unlock(&queue_mutex);
-        return 1;
-    }
-    pthread_mutex_unlock(&queue_mutex);
-    return 0;
+    return (hid_interface_get_active_effects(effect_out, 1) == 1) ? 1 : 0;
 }
 
 /**

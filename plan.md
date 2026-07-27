@@ -189,12 +189,12 @@ Tracked files that should be in `.gitignore`:
 
 | # | File(s) | Issue | Done |
 |---|---------|-------|------|
-| 1 | `main.c` | `VTIME=1` blocks loop | [ ] |
-| 2 | `hid_interface.c` | `effect->type` never set | [ ] |
-| 3 | `hid_interface.c`, `main.c` | No persistent effect table | [ ] |
-| 4 | `main.c` | Pause leaves torque active | [ ] |
-| 5 | `main.c` | Emergency stop unreachable + auto-clears | [ ] |
-| 6 | `ffb_calculator.c` | Case-label declarations, C11 error | [ ] |
+| 1 | `main.c` | `VTIME=1` blocks loop | [x] |
+| 2 | `hid_interface.c` | `effect->type` never set | [x] |
+| 3 | `hid_interface.c`, `main.c` | No persistent effect table | [x] |
+| 4 | `main.c` | Pause leaves torque active | [x] |
+| 5 | `main.c` | Emergency stop unreachable + auto-clears | [x] |
+| 6 | `ffb_calculator.c` | Case-label declarations, C11 error | [x] |
 | 7 | `soem_interface.c` | Partial PDO memset (5/35 bytes) | [ ] |
 | 8 | `soem_interface.c`, `main.c` | 14-bit vs 16-bit confusion | [ ] |
 | 9 | `soem_interface.c` | Interpolation time SDO wrong (10 ms → 1 ms) | [ ] |

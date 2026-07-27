@@ -28,7 +28,8 @@
 #define MAX_TORQUE_LIMIT 5000.0f   // Maximum torque in appropriate units
 #define STATS_PRINT_INTERVAL 100   // Print stats every 100 loops (1 second at 100Hz)
 #define MAX_LATE_WARNINGS 20       // Reduced warnings
-#define EMERGENCY_STOP_THRESHOLD 10000.0f // Emergency torque threshold
+#define EMERGENCY_STOP_THRESHOLD 4500.0f  /* Latching threshold — within the ±5000 clamp range */
+                                          /* Clear only with Ctrl+E, never automatically           */
 
 // **SYNAPTICON 16-BIT ENCODER SPECIFICATIONS**
 // 16-bit absolute encoder = 65,536 counts per revolution
@@ -203,6 +204,14 @@ int check_ctrl_combinations() {
                 printf("Ctrl+L pressed - toggling FFB logging!\n");
                 toggle_logging();
                 return 1;
+            case 5: // Ctrl+E — clear latched emergency stop
+                if (emergency_stop) {
+                    printf("Ctrl+E pressed - emergency stop cleared!\n");
+                    emergency_stop = 0;
+                } else {
+                    printf("Ctrl+E pressed (no active emergency stop)\n");
+                }
+                return 1;
         }
     }
     return 0;
@@ -325,7 +334,7 @@ void enable_raw_mode() {
     raw.c_cflag |= (CS8);
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
     raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
+    raw.c_cc[VTIME] = 0; /* Non-blocking: read() returns immediately with 0 bytes if nothing available */
     
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
@@ -643,7 +652,8 @@ int main(int argc, char *argv[]) {
         
         // Skip control if paused
         if (pause_control) {
-            usleep(10000); // Sleep 10ms when paused
+            soem_interface_send_and_receive_pdo(0.0f); /* zero torque while paused */
+            usleep(10000);
             continue;
         }
         
@@ -666,13 +676,21 @@ int main(int argc, char *argv[]) {
         // 3. Get velocity from servo
         app_state.current_velocity = soem_interface_get_current_velocity();
         
-        // 4. Get FFB commands from PC
-        app_state.effect_available = hid_interface_get_ffb_effect(&app_state.current_ffb_effect);
+        // 4. Collect all currently running effects from the persistent slot table
+        ffb_motor_effect_t active_effects[FFB_EFFECT_SLOTS];
+        int active_count = hid_interface_get_active_effects(active_effects, FFB_EFFECT_SLOTS);
+        app_state.effect_available = (active_count > 0);
+        if (active_count > 0) {
+            app_state.current_ffb_effect = active_effects[0];
+        }
         const ffb_motor_effect_t *effect_ptr = app_state.effect_available ? &app_state.current_ffb_effect : NULL;
-        
-        // 5. Calculate desired torque (use relative position in encoder counts)
-        app_state.desired_torque = ffb_calculator_calculate_torque(
-            effect_ptr, app_state.current_position_relative, app_state.current_velocity);
+
+        // 5. Sum torque from all running effects so simultaneous effects all contribute
+        app_state.desired_torque = 0.0f;
+        for (int i = 0; i < active_count; i++) {
+            app_state.desired_torque += ffb_calculator_calculate_torque(
+                &active_effects[i], app_state.current_position_relative, app_state.current_velocity);
+        }
         
         // 6. Apply safety checks
         apply_safety_checks(&app_state);
@@ -715,11 +733,7 @@ int main(int argc, char *argv[]) {
         // 13. Maintain loop timing
         maintain_loop_timing(&app_state.loop_start_time, &app_state.loop_end_time);
         
-        // Clear emergency stop if torque is back to normal
-        if (emergency_stop && fabs(app_state.desired_torque) < MAX_TORQUE_LIMIT * 0.5f) {
-            emergency_stop = 0;
-            printf("Emergency stop cleared\n");
-        }
+        /* Emergency stop is latched — cleared only by Ctrl+E in check_ctrl_combinations(). */
     }
     
     // --- Final Statistics and Cleanup ---

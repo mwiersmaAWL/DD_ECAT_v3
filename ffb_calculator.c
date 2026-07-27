@@ -59,7 +59,7 @@ float ffb_calculator_calculate_torque(const ffb_motor_effect_t *effect, float cu
                 desired_torque = effect->magnitude * 1000.0f;
                 break;
                 
-            case FFB_EFFECT_SPRING:
+            case FFB_EFFECT_SPRING: {
                 // Spring effect: Torque proportional to displacement from a center point.
                 // Use spring coefficient if available, otherwise use magnitude
                 float center_position = 0.0f; // Assuming center is 0
@@ -67,26 +67,29 @@ float ffb_calculator_calculate_torque(const ffb_motor_effect_t *effect, float cu
                 float spring_gain = 0.8f * spring_strength;
                 desired_torque = -(current_position - center_position) * spring_gain * 500.0f;
                 break;
+            }
                 
-            case FFB_EFFECT_DAMPER:
+            case FFB_EFFECT_DAMPER: {
                 // Damper effect: Torque proportional to velocity, opposing motion.
                 float damper_strength = (effect->damper_coefficient > 0) ? effect->damper_coefficient : effect->magnitude;
                 float damper_gain = 1.0f * damper_strength;
                 desired_torque = -current_velocity * damper_gain * 200.0f;
                 break;
+            }
                 
-            case FFB_EFFECT_INERTIA:
+            case FFB_EFFECT_INERTIA: {
                 // Inertia effect: Resistance to acceleration (simplified as velocity-based)
                 float inertia_strength = (effect->inertia_coefficient > 0) ? effect->inertia_coefficient : effect->magnitude;
                 float inertia_gain = 0.5f * inertia_strength;
                 desired_torque = -current_velocity * inertia_gain * 300.0f;
                 break;
+            }
                 
-            case FFB_EFFECT_FRICTION:
+            case FFB_EFFECT_FRICTION: {
                 // Friction effect: Constant resistance to motion
                 float friction_strength = (effect->friction_coefficient > 0) ? effect->friction_coefficient : effect->magnitude;
                 float friction_force = friction_strength * 400.0f;
-                
+
                 // Apply friction opposite to motion direction
                 if (current_velocity > 0.01f) {
                     desired_torque = -friction_force;
@@ -96,20 +99,21 @@ float ffb_calculator_calculate_torque(const ffb_motor_effect_t *effect, float cu
                     desired_torque = 0.0f; // No friction when stationary
                 }
                 break;
+            }
                 
-            case FFB_EFFECT_PERIODIC:
+            case FFB_EFFECT_PERIODIC: {
                 // Periodic effect: Sine wave, square wave, etc.
                 // Unpack parameters from the stored fields
                 uint8_t waveform = (uint8_t)effect->start_delay;
                 uint8_t frequency = (uint8_t)(effect->timestamp >> 16);
                 uint8_t phase = (uint8_t)(effect->timestamp >> 8);
                 uint8_t offset = (uint8_t)effect->timestamp;
-                
+
                 float time_sec = current_time / 1000.0f;
                 float angular_freq = 2.0f * M_PI * frequency;
                 float phase_rad = phase * M_PI / 128.0f; // Convert to radians
                 float offset_norm = (offset - 128) / 128.0f; // Normalize offset
-                
+
                 float wave_value = 0.0f;
                 switch (waveform) {
                     case 0: // Square wave
@@ -134,27 +138,29 @@ float ffb_calculator_calculate_torque(const ffb_motor_effect_t *effect, float cu
                         wave_value = sinf(angular_freq * time_sec + phase_rad); // Default to sine
                         break;
                 }
-                
+
                 desired_torque = (wave_value * effect->magnitude + offset_norm) * 800.0f;
                 break;
+            }
                 
-            case FFB_EFFECT_RAMP:
+            case FFB_EFFECT_RAMP: {
                 // Ramp effect: Linear interpolation between start and end magnitude
                 if (effect->duration > 0) {
                     float start_magnitude = effect->magnitude;
                     float end_magnitude = effect->direction; // Reused field
                     float elapsed_time = current_time - effect->timestamp;
                     float progress = elapsed_time / effect->duration;
-                    
+
                     if (progress < 0.0f) progress = 0.0f;
                     if (progress > 1.0f) progress = 1.0f;
-                    
+
                     float current_magnitude = start_magnitude + (end_magnitude - start_magnitude) * progress;
                     desired_torque = current_magnitude * 1000.0f;
                 } else {
                     desired_torque = effect->magnitude * 1000.0f;
                 }
                 break;
+            }
                 
             default:
                 // Unknown effect type, apply no force
