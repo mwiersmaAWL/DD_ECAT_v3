@@ -1,14 +1,16 @@
-// soem_interface.c - Fixed for Synapticon 14-bit absolute encoder
+// soem_interface.c - Fixed for Synapticon 16-bit absolute encoder
 #include "soem_interface.h" 
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <stdbool.h>
 #include <time.h>
 #include <errno.h>
+#include <sched.h>
 
 // --- SOEM Library Includes ---
 #include "ethercat.h"  
@@ -87,7 +89,9 @@ static pthread_mutex_t pdo_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t ecat_thread;
 static volatile int ecat_thread_running = 0;
 static volatile int master_initialized = 0;
-static volatile int communication_ok = 0;
+/* Issue #16: written by ecat_loop, read by soem_interface_get_communication_status()
+ * without mutex coverage — use _Atomic to make the cross-thread read safe.        */
+static _Atomic int communication_ok = 0;
 
 // Global variables to hold current PDO values
 static float target_torque_f = 0.0f;
@@ -96,6 +100,32 @@ static float current_velocity_f = 0.0f;
 static cia402_state_t current_cia402_state = CIA402_STATE_NOT_READY;
 static uint16_t current_statusword = 0;
 static uint16_t current_controlword = 0;
+
+/**
+ * @brief PI controller to align the local EtherCAT cyclic thread to the DC sync0 boundary.
+ *
+ * After ec_receive_processdata(), ec_DCtime holds the distributed clock reference
+ * time in nanoseconds.  This function computes a small nanosecond offset to add to
+ * the next absolute sleep deadline so that the thread gradually synchronises to the
+ * DC master clock.  Based on the canonical SOEM dc_rtex example.
+ *
+ * Args:
+ *     reftime:      Current DC reference clock (ec_DCtime) in nanoseconds.
+ *     cycletime_ns: Nominal cycle period in nanoseconds.
+ *     integral:     Persistent integrator state; caller must zero-initialise once.
+ *
+ * Returns:
+ *     Nanosecond correction to add to the next wakeup timestamp.
+ */
+static int64_t compute_dc_offset(int64_t reftime, int64_t cycletime_ns, int64_t *integral) {
+    /* Phase error: distance of the reference clock from the nearest cycle boundary,
+     * shifted 50 µs early so the thread wakes slightly before the sync pulse.     */
+    int64_t delta = (reftime - 50000LL) % cycletime_ns;
+    if (delta > cycletime_ns / 2LL) delta -= cycletime_ns;
+    /* PI: proportional term + slow integrator to eliminate steady-state offset.    */
+    *integral += (delta > 0LL) ? 1LL : -1LL;
+    return -(delta / 100LL) - (*integral / 20LL);
+}
 
 // --- CiA 402 State Machine Functions ---
 cia402_state_t get_cia402_state(uint16_t statusword) {
@@ -168,7 +198,7 @@ uint16_t get_cia402_controlword_for_transition(cia402_state_t current_state, cia
 
 // Function to initialize CiA 402 parameters via SDO - CONFIGURED FOR SYNAPTICON
 int initialize_cia402_parameters(uint16_t slave_idx) {
-    printf("SOEM_Interface: Initializing CiA 402 parameters for Synapticon 14-bit encoder...\n");
+    printf("SOEM_Interface: Initializing CiA 402 parameters for Synapticon 16-bit encoder...\n");
     
     // Set modes of operation to torque mode (4)
     int8_t torque_mode = 4;
@@ -203,13 +233,13 @@ int initialize_cia402_parameters(uint16_t slave_idx) {
         printf("SOEM_Interface: Set torque slope to %u per mille/s\n", torque_slope);
     }
     
-    // **SYNAPTICON-SPECIFIC: Set encoder resolution to match 14-bit encoder**
-    // Set position encoder resolution (16384 increments per revolution for 14-bit)
-    uint32_t encoder_increments = 65536.0f; // 2^16 = 65536.0 for 16-bit encoder
+    // **SYNAPTICON-SPECIFIC: Set encoder resolution to match 16-bit encoder**
+    // Set position encoder resolution (65536 increments per revolution for 16-bit)
+    uint32_t encoder_increments = (uint32_t)65536; // 2^16 = 65536 for 16-bit encoder
     if (soem_interface_write_sdo(slave_idx, 0x608F, 0x01, sizeof(encoder_increments), &encoder_increments) != 0) {
         printf("SOEM_Interface: Warning: Failed to set encoder increments (may use internal default)\n");
     } else {
-        printf("SOEM_Interface: Set encoder increments to %u per revolution (14-bit)\n", encoder_increments);
+        printf("SOEM_Interface: Set encoder increments to %u per revolution (16-bit)\n", encoder_increments);
     }
     
     // Set gear ratio to 1:1 (direct drive)
@@ -221,8 +251,8 @@ int initialize_cia402_parameters(uint16_t slave_idx) {
         printf("SOEM_Interface: Set gear ratio numerator to %u\n", gear_ratio_num);
     }
     
-    // Set interpolation time period (for smoother operation)
-    uint8_t interpolation_time_period = 10; // 10ms to match our cycle time
+    // Set interpolation time period — must match the EtherCAT PDO cycle time (1 ms at 1 kHz)
+    uint8_t interpolation_time_period = 1; // 1 ms to match 1 kHz EtherCAT PDO cycle
     int8_t interpolation_time_index = -3;  // 10^-3 seconds (milliseconds)
     if (soem_interface_write_sdo(slave_idx, 0x60C2, 0x01, sizeof(interpolation_time_period), &interpolation_time_period) != 0) {
         printf("SOEM_Interface: Warning: Failed to set interpolation time period\n");
@@ -252,7 +282,7 @@ int initialize_cia402_parameters(uint16_t slave_idx) {
         printf("SOEM_Interface: Warning: Could not verify modes of operation\n");
     }
     
-    printf("SOEM_Interface: Synapticon 14-bit encoder initialization completed\n");
+    printf("SOEM_Interface: Synapticon 16-bit encoder initialization completed\n");
     return 0;
 }
 
@@ -433,6 +463,20 @@ void *ecat_loop(void *ptr) {
     int slave_idx = 1;
     int state_machine_initialized = 0;
 
+    /* Issue #14: Pin this thread to core 3 (isolated by isolcpus=3 kernel
+     * parameter) with SCHED_FIFO priority 80 to minimise jitter in the
+     * EtherCAT cyclic exchange.  The main loop runs on core 2 at priority 50.*/
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(3, &cpuset);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+        perror("SOEM_Interface: EtherCAT thread: failed to set affinity to core 3");
+    }
+    struct sched_param rt_param = { .sched_priority = 80 };
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &rt_param) != 0) {
+        perror("SOEM_Interface: EtherCAT thread: failed to set SCHED_FIFO priority 80");
+    }
+
     printf("SOEM_Interface: EtherCAT thread started (%d µs cycle time).\n", cycle_time);
 
     while (!master_initialized && ecat_thread_running) {
@@ -449,6 +493,10 @@ void *ecat_loop(void *ptr) {
     // Use absolute-time sleeping to prevent cumulative drift from relative nanosleep
     struct timespec next_wakeup;
     clock_gettime(CLOCK_MONOTONIC, &next_wakeup);
+
+    /* Issue #17: integrator state for the DC sync PI controller.
+     * Must be zero-initialised once before the loop.                         */
+    int64_t dc_integral = 0LL;
 
     while (ecat_thread_running) {
         // Advance absolute deadline at the top of the loop
@@ -512,7 +560,7 @@ void *ecat_loop(void *ptr) {
                 if (perform_cia402_transition_to_operational(slave_idx) == 0) {
                     state_machine_initialized = 1;
                     printf("SOEM_Interface: CiA 402 state machine initialized to Operation Enabled.\n");
-                    printf("SOEM_Interface: 14-bit encoder ready, resolution: %.0f counts/rev\n", ENCODER_COUNTS_PER_REV);
+                    printf("SOEM_Interface: 16-bit encoder ready, resolution: %.0f counts/rev\n", ENCODER_COUNTS_PER_REV);
                 } else {
                     fprintf(stderr, "SOEM_Interface: Failed to initialize CiA 402 state machine.\n");
                     communication_ok = 0; 
@@ -523,6 +571,24 @@ void *ecat_loop(void *ptr) {
         // Check EtherCAT slave state periodically
         if (!is_slave_operational(slave_idx)) {
             ec_statecheck(slave_idx, EC_STATE_OPERATIONAL, 100000);
+        }
+
+        /* Issue #17: Align next wakeup to the DC sync0 boundary.
+         * ec_DCtime is updated by ec_receive_processdata() and holds the
+         * distributed clock reference time in nanoseconds.  The PI controller
+         * (compute_dc_offset) nudges next_wakeup so the thread gradually
+         * phase-locks to the DC master, eliminating the accumulated drift that
+         * ec_configdc() enables but free-running CLOCK_MONOTONIC sleep ignores. */
+        int64_t toff = compute_dc_offset((int64_t)ec_DCtime,
+                                          (int64_t)cycle_time * 1000LL,
+                                          &dc_integral);
+        next_wakeup.tv_nsec += (long)toff;
+        if (next_wakeup.tv_nsec >= 1000000000L) {
+            next_wakeup.tv_sec++;
+            next_wakeup.tv_nsec -= 1000000000L;
+        } else if (next_wakeup.tv_nsec < 0L) {
+            next_wakeup.tv_sec--;
+            next_wakeup.tv_nsec += 1000000000L;
         }
 
         // Sleep until absolute deadline — prevents accumulated drift from relative nanosleep
@@ -551,7 +617,7 @@ int soem_interface_init_enhanced(const char *ifname) {
     int i;
     int slave_idx = 1;
 
-    printf("SOEM_Interface: Enhanced initialization for Synapticon 14-bit encoder on %s...\n", ifname);
+    printf("SOEM_Interface: Enhanced initialization for Synapticon 16-bit encoder on %s...\n", ifname);
 
     if (!ec_init(ifname)) {
         fprintf(stderr, "SOEM_Interface: ec_init failed on %s\n", ifname);
@@ -611,7 +677,7 @@ int soem_interface_init_enhanced(const char *ifname) {
     
     if (ec_slave[slave_idx].inputs > 0) {
         somanet_inputs = (somanet_tx_pdo_enhanced_t *)(ec_slave[slave_idx].inputs);
-        printf("SOEM_Interface: somanet_inputs mapped successfully (14-bit encoder data)\n");
+        printf("SOEM_Interface: somanet_inputs mapped successfully (16-bit encoder data)\n");
     } else {
         fprintf(stderr, "SOEM_Interface: No input PDO data available!\n");
         return -1;
@@ -625,9 +691,10 @@ int soem_interface_init_enhanced(const char *ifname) {
         printf("SOEM_Interface: CiA 402 initialization had issues, continuing anyway\n");
     }
     
-    // Initialize safe values
+    // Initialize safe values — zero the entire slave output buffer, not just the struct
+    // prefix (issue 7: somanet_rx_pdo_enhanced_t is 5 bytes but the SM is up to 35 bytes).
+    memset(ec_slave[slave_idx].outputs, 0, (size_t)(ec_slave[slave_idx].Obits / 8));
     if (somanet_outputs) {
-        memset(somanet_outputs, 0, sizeof(somanet_rx_pdo_enhanced_t));
         somanet_outputs->controlword = 0x0006; // Shutdown
         somanet_outputs->modes_of_operation = 4; // Torque mode
     }
@@ -688,7 +755,7 @@ int soem_interface_init_enhanced(const char *ifname) {
         }
     }
     
-    printf("SOEM_Interface: Synapticon 14-bit encoder initialization completed successfully\n");
+    printf("SOEM_Interface: Synapticon 16-bit encoder initialization completed successfully\n");
     return 0;
 }
 
@@ -716,15 +783,24 @@ float soem_interface_get_current_velocity() {
 }
 
 int soem_interface_get_communication_status() {
-    return communication_ok;
+    return atomic_load_explicit(&communication_ok, memory_order_relaxed);
 }
 
 cia402_state_t soem_interface_get_cia402_state() {
-    return current_cia402_state;
+    /* Issue #16: current_cia402_state is written under pdo_mutex but the
+     * getter had no mutex coverage.  Lock pdo_mutex for the read.          */
+    pthread_mutex_lock(&pdo_mutex);
+    cia402_state_t state = current_cia402_state;
+    pthread_mutex_unlock(&pdo_mutex);
+    return state;
 }
 
 uint16_t soem_interface_get_statusword() {
-    return current_statusword;
+    /* Issue #16: same as above — add pdo_mutex coverage for the read.      */
+    pthread_mutex_lock(&pdo_mutex);
+    uint16_t sw = current_statusword;
+    pthread_mutex_unlock(&pdo_mutex);
+    return sw;
 }
 
 void soem_interface_stop_master() {

@@ -8,6 +8,8 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <inttypes.h>
+#include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <pthread.h>
@@ -39,8 +41,27 @@
 
 // **FFB LOGGING CONFIGURATION**
 #define LOG_FILENAME_FORMAT "ffb_log_%Y%m%d_%H%M%S.csv"
-#define LOG_BUFFER_SIZE 1024
-#define LOG_FLUSH_INTERVAL 50  // Flush every 50 loops (0.5 seconds)
+
+/* Issue #15: Lock-free SPSC ring buffer for asynchronous CSV logging.
+ * The RT main thread (producer) writes log entries into preallocated slots via
+ * snprintf; the dedicated logger thread (consumer) drains them to disk with
+ * fwrite/fflush, keeping all blocking I/O off the real-time path.
+ *
+ * LOG_RING_CAPACITY must be a power of 2 for cheap modulo-free wrap-around.
+ * At 100 Hz and 2048 slots, the logger thread has ~20 seconds of headroom
+ * before entries are dropped.                                                 */
+#define LOG_RING_CAPACITY  2048u
+#define LOG_LINE_MAX       512u
+
+typedef struct {
+    char line[LOG_LINE_MAX];
+} log_ring_entry_t;
+
+static log_ring_entry_t   log_ring[LOG_RING_CAPACITY];
+/* log_ring_write: advanced only by the RT main thread (producer).            */
+static _Atomic size_t     log_ring_write = 0;
+/* log_ring_read:  advanced only by the logger thread (consumer).             */
+static _Atomic size_t     log_ring_read  = 0;
 
 // Global flags and state
 static volatile int running = 1;
@@ -56,8 +77,17 @@ static int position_system_initialized = 0;
 // FFB Logging system
 static FILE *log_file = NULL;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int log_counter = 0;
-static int logging_enabled = 1;  // Can be toggled
+/* Issue #16: log_counter is incremented by the logger thread (consumer) and
+ * read from the main thread for stats — use _Atomic to make reads safe.     */
+static _Atomic int log_counter = 0;
+/* Issue #16: logging_enabled is toggled by Ctrl+L (main thread) and read by
+ * log_ffb_data (also main thread) — making it _Atomic is defensive and
+ * documents the intent that it may be safely read from any thread.           */
+static _Atomic int logging_enabled = 1;
+
+/* Logger thread — drains log_ring to disk at low priority.                   */
+static pthread_t logger_thread;
+static volatile int logger_running = 0;
 
 //Keyboard inputs
 struct termios orig_termios;
@@ -68,39 +98,122 @@ static void cleanup_ffb_logging(void);
 static void log_ffb_data(const ffb_motor_effect_t *ffb_effect, float position_deg, float velocity, float torque_out, int effect_available);
 static void toggle_logging(void);
 
-// Initialize FFB logging system
+/**
+ * @brief Background logger thread: drains the log ring buffer to disk.
+ *
+ * Runs at SCHED_OTHER (normal) priority so it never competes with real-time
+ * threads.  The RT main thread only snprintf()s into pre-allocated ring slots
+ * and publishes them with an atomic store — no file I/O on the RT path.
+ *
+ * Args:
+ *     arg: Unused.
+ *
+ * Returns:
+ *     NULL.
+ */
+static void *_logger_thread_func(void *arg) {
+    (void)arg;
+
+    /* Stay off the RT cores; let the scheduler place us where convenient.    */
+    struct sched_param sp = { .sched_priority = 0 };
+    pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+
+    printf("Logger: thread started\n");
+
+    while (logger_running) {
+        size_t ri = atomic_load_explicit(&log_ring_read,  memory_order_relaxed);
+        size_t wi = atomic_load_explicit(&log_ring_write, memory_order_acquire);
+
+        if (ri == wi) {
+            usleep(2000); /* 2 ms poll interval — low latency without busy-spinning */
+            continue;
+        }
+
+        /* Drain all available entries in one pass, then flush once. */
+        pthread_mutex_lock(&log_mutex);
+        while (ri != wi && log_file) {
+            fputs(log_ring[ri].line, log_file);
+            atomic_fetch_add_explicit(&log_counter, 1, memory_order_relaxed);
+            ri = (ri + 1u) % LOG_RING_CAPACITY;
+        }
+        if (log_file) fflush(log_file);
+        pthread_mutex_unlock(&log_mutex);
+
+        atomic_store_explicit(&log_ring_read, ri, memory_order_release);
+    }
+
+    /* Final drain: flush any entries produced after the last poll. */
+    {
+        size_t ri = atomic_load_explicit(&log_ring_read,  memory_order_relaxed);
+        size_t wi = atomic_load_explicit(&log_ring_write, memory_order_acquire);
+        pthread_mutex_lock(&log_mutex);
+        while (ri != wi && log_file) {
+            fputs(log_ring[ri].line, log_file);
+            atomic_fetch_add_explicit(&log_counter, 1, memory_order_relaxed);
+            ri = (ri + 1u) % LOG_RING_CAPACITY;
+        }
+        if (log_file) fflush(log_file);
+        pthread_mutex_unlock(&log_mutex);
+        atomic_store_explicit(&log_ring_read, ri, memory_order_release);
+    }
+
+    printf("Logger: thread stopped\n");
+    return NULL;
+}
+
+/**
+ * @brief Initializes the FFB logging system and starts the logger thread.
+ *
+ * Returns:
+ *     0 on success, -1 on failure (logging disabled by caller).
+ */
 static int init_ffb_logging(void) {
     char filename[256];
     time_t rawtime;
     struct tm *timeinfo;
-    
-    // Generate timestamp-based filename
+
     time(&rawtime);
     timeinfo = localtime(&rawtime);
     strftime(filename, sizeof(filename), LOG_FILENAME_FORMAT, timeinfo);
-    
-    // Open log file
+
     log_file = fopen(filename, "w");
     if (!log_file) {
         perror("Failed to create FFB log file");
         return -1;
     }
-    
-    // Write CSV header
+
+    /* Write CSV header — blocking I/O is acceptable here (startup path). */
     fprintf(log_file, "timestamp_ms,loop_count,position_deg,velocity_deg_s,effect_available,");
     fprintf(log_file, "report_id,effect_type_enum,effect_type_raw,magnitude,direction_deg,duration_ms,");
     fprintf(log_file, "spring_coeff,damper_coeff,friction_coeff,inertia_coeff,center_pos,dead_band,");
     fprintf(log_file, "attack_level,attack_time_ms,fade_level,fade_time_ms,");
     fprintf(log_file, "torque_output,emergency_stop,ethercat_status\n");
-    
     fflush(log_file);
-    
+
+    logger_running = 1;
+    if (pthread_create(&logger_thread, NULL, _logger_thread_func, NULL) != 0) {
+        perror("Failed to create logger thread");
+        fclose(log_file);
+        log_file = NULL;
+        logger_running = 0;
+        return -1;
+    }
+
     printf("FFB logging initialized: %s\n", filename);
     return 0;
 }
 
-// Cleanup FFB logging
+/**
+ * @brief Stops the logger thread, drains remaining entries, and closes the log file.
+ */
 static void cleanup_ffb_logging(void) {
+    /* Signal the logger thread to stop; it will drain the ring before exiting. */
+    logger_running = 0;
+    if (logger_thread) {
+        pthread_join(logger_thread, NULL);
+        logger_thread = 0;
+    }
+
     pthread_mutex_lock(&log_mutex);
     if (log_file) {
         fflush(log_file);
@@ -111,77 +224,97 @@ static void cleanup_ffb_logging(void) {
     pthread_mutex_unlock(&log_mutex);
 }
 
-// Log FFB data to CSV file
-static void log_ffb_data(const ffb_motor_effect_t *ffb_effect, float position_deg, float velocity, float torque_out, int effect_available) {
-    if (!logging_enabled) return;
-    
-    pthread_mutex_lock(&log_mutex);
-    
-    if (!log_file) {
-        pthread_mutex_unlock(&log_mutex);
-        return;
+/**
+ * @brief Writes one CSV log line into the ring buffer — no file I/O on the RT path.
+ *
+ * Uses snprintf into a pre-allocated ring slot and publishes it to the logger
+ * thread with an atomic store.  If the ring is full the entry is silently
+ * dropped to avoid blocking.  Issue #15: timestamp uses int64_t + PRId64 to
+ * avoid overflow on 32-bit hosts.
+ *
+ * Args:
+ *     ffb_effect:       Pointer to the current effect, or NULL if none.
+ *     position_deg:     Current steering angle in degrees.
+ *     velocity:         Current angular velocity in degrees/s.
+ *     torque_out:       Computed torque command.
+ *     effect_available: Non-zero when ffb_effect is valid.
+ */
+static void log_ffb_data(const ffb_motor_effect_t *ffb_effect, float position_deg,
+                          float velocity, float torque_out, int effect_available) {
+    if (!atomic_load_explicit(&logging_enabled, memory_order_relaxed)) return;
+
+    /* Claim a ring slot — drop silently if the buffer is full. */
+    size_t wi      = atomic_load_explicit(&log_ring_write, memory_order_relaxed);
+    size_t next_wi = (wi + 1u) % LOG_RING_CAPACITY;
+    if (next_wi == atomic_load_explicit(&log_ring_read, memory_order_acquire)) {
+        return; /* Full: drop entry rather than blocking the RT thread. */
     }
-    
-    // Get current timestamp in milliseconds
+
+    log_ring_entry_t *entry = &log_ring[wi];
+
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    long timestamp_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    
-    // Log basic data
-    fprintf(log_file, "%ld,%d,%.3f,%.3f,%d,", 
-            timestamp_ms, log_counter, position_deg, velocity, effect_available);
-    
-    // Log FFB effect data (if available)
+    /* Issue #15: use int64_t + PRId64 — long overflows on 32-bit hosts after ~25 days. */
+    int64_t timestamp_ms = (int64_t)ts.tv_sec * 1000LL +
+                           (int64_t)(ts.tv_nsec / 1000000L);
+
+    int n;
     if (effect_available && ffb_effect) {
-        fprintf(log_file, "%d,%d,%d,%.3f,%.3f,%d,",
-                ffb_effect->report_id,
-                (int)ffb_effect->type,
-                ffb_effect->effect_type,
-                ffb_effect->magnitude,
-                ffb_effect->direction,
-                ffb_effect->duration_ms);
-        
-        // Log coefficient parameters
-        fprintf(log_file, "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,",
-                ffb_effect->spring_coefficient,
-                ffb_effect->damper_coefficient,
-                ffb_effect->friction_coefficient,
-                ffb_effect->inertia_coefficient,
-                ffb_effect->center_position,
-                ffb_effect->dead_band);
-        
-        // Log envelope parameters
-        fprintf(log_file, "%.3f,%d,%.3f,%d,",
-                ffb_effect->attack_level,
-                ffb_effect->attack_time_ms,
-                ffb_effect->fade_level,
-                ffb_effect->fade_time_ms);
-    } else {
-        // No effect available - log zeros/empty values for all FFB fields
-        fprintf(log_file, "0,0,0,0.0,0.0,0,");           // basic effect data
-        fprintf(log_file, "0.0,0.0,0.0,0.0,0.0,0.0,");   // coefficients
-        fprintf(log_file, "0.0,0,0.0,0,");               // envelope
-    }
-    
-    // Log output torque and status
-    fprintf(log_file, "%.3f,%d,%d\n", 
-            torque_out, emergency_stop ? 1 : 0, 
+        n = snprintf(entry->line, LOG_LINE_MAX,
+            "%" PRId64 ",%zu,%.3f,%.3f,%d,"
+            "%d,%d,%d,%.3f,%.3f,%d,"
+            "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+            "%.3f,%d,%.3f,%d,"
+            "%.3f,%d,%d\n",
+            timestamp_ms, wi, position_deg, velocity, effect_available,
+            (int)ffb_effect->report_id,
+            (int)ffb_effect->type,
+            (int)ffb_effect->effect_type,
+            (double)ffb_effect->magnitude,
+            (double)ffb_effect->direction,
+            ffb_effect->duration_ms,
+            (double)ffb_effect->spring_coefficient,
+            (double)ffb_effect->damper_coefficient,
+            (double)ffb_effect->friction_coefficient,
+            (double)ffb_effect->inertia_coefficient,
+            (double)ffb_effect->center_position,
+            (double)ffb_effect->dead_band,
+            (double)ffb_effect->attack_level,
+            ffb_effect->attack_time_ms,
+            (double)ffb_effect->fade_level,
+            ffb_effect->fade_time_ms,
+            (double)torque_out,
+            emergency_stop ? 1 : 0,
             soem_interface_get_communication_status() ? 1 : 0);
-    
-    log_counter++;
-    
-    // Flush periodically for real-time monitoring
-    if (log_counter % LOG_FLUSH_INTERVAL == 0) {
-        fflush(log_file);
+    } else {
+        n = snprintf(entry->line, LOG_LINE_MAX,
+            "%" PRId64 ",%zu,%.3f,%.3f,%d,"
+            "0,0,0,0.0,0.0,0,"
+            "0.0,0.0,0.0,0.0,0.0,0.0,"
+            "0.0,0,0.0,0,"
+            "%.3f,%d,%d\n",
+            timestamp_ms, wi, position_deg, velocity, effect_available,
+            (double)torque_out,
+            emergency_stop ? 1 : 0,
+            soem_interface_get_communication_status() ? 1 : 0);
     }
-    
-    pthread_mutex_unlock(&log_mutex);
+
+    /* Guard against snprintf truncation leaving a non-terminated string. */
+    if (n <= 0 || (size_t)n >= LOG_LINE_MAX) {
+        entry->line[LOG_LINE_MAX - 1u] = '\0';
+    }
+
+    /* Publish the slot to the logger thread. */
+    atomic_store_explicit(&log_ring_write, next_wi, memory_order_release);
 }
 
-// Toggle logging on/off
+/**
+ * @brief Toggles CSV logging on or off (called from Ctrl+L handler).
+ */
 static void toggle_logging(void) {
-    logging_enabled = !logging_enabled;
-    printf("FFB logging %s\n", logging_enabled ? "enabled" : "disabled");
+    int new_val = !atomic_load_explicit(&logging_enabled, memory_order_relaxed);
+    atomic_store_explicit(&logging_enabled, new_val, memory_order_relaxed);
+    printf("FFB logging %s\n", new_val ? "enabled" : "disabled");
 }
 
 int check_ctrl_combinations() {
@@ -410,12 +543,36 @@ static long timespec_diff_ns(const struct timespec *start, const struct timespec
 
 // Centralized position system update - FIXED FOR SYNAPTICON 16-BIT ENCODER
 static void update_position_system(app_state_t *state) {
-    // Get raw position from SOEM (encoder counts)
-    state->current_position_raw = soem_interface_get_current_position();
-    
+    float raw_pos = soem_interface_get_current_position();
+
+    /* Encoder wrap/unwrap for single-turn absolute encoders (issue 10).
+     * If the drive reports single-turn absolute counts (0–65535), a revolution
+     * crossing produces a ±ENCODER_COUNTS_PER_REV jump in the raw value.  We
+     * detect that by checking whether the per-cycle delta exceeds half the full
+     * range and apply a running integer offset to reconstruct a continuous
+     * multi-turn position.
+     * For drives that already return multi-turn signed int32, the delta never
+     * crosses the threshold and wrap_offset stays zero (no-op).
+     */
+    static float prev_raw    = 0.0f;
+    static float wrap_offset = 0.0f;
+    static int   wrap_init   = 0;
+
+    if (!wrap_init) {
+        prev_raw  = raw_pos;
+        wrap_init = 1;
+    } else {
+        float delta = raw_pos - prev_raw;
+        if (delta >  (ENCODER_COUNTS_PER_REV * 0.5f)) { wrap_offset -= ENCODER_COUNTS_PER_REV; }
+        if (delta < -(ENCODER_COUNTS_PER_REV * 0.5f)) { wrap_offset += ENCODER_COUNTS_PER_REV; }
+        prev_raw = raw_pos;
+    }
+
+    state->current_position_raw = raw_pos + wrap_offset;
+
     pthread_mutex_lock(&position_global_mutex);
     
-    // Update global position
+    // Update global position (unwrapped)
     global_current_position = state->current_position_raw;
     
     // Initialize center position on first run
@@ -445,8 +602,8 @@ static void update_position_system(app_state_t *state) {
     // Enhanced debug output (reduced frequency)
     static int debug_counter = 0;
     if (++debug_counter % 50 == 0) {  // Every 50 loops (0.5 seconds)
-        printf("Position: Raw=%.0f, Center=%.0f, Rel=%.0f, Deg=%.1f°, Norm=%.4f, Rev=%.3f\n",
-               state->current_position_raw, global_center_position, 
+        printf("Position: Raw=%.0f, Unwrapped=%.0f, Center=%.0f, Rel=%.0f, Deg=%.1f°, Norm=%.4f, Rev=%.3f\n",
+               raw_pos, state->current_position_raw, global_center_position,
                state->current_position_relative, state->current_angle_degrees, 
                state->normalized_position, state->current_angle_degrees / 360.0f);
     }
@@ -489,8 +646,9 @@ static void print_performance_stats(const performance_stats_t *stats) {
     printf("Encoder: Synapticon 16-bit absolute, %.0f counts/rev, ±%.0f° range\n", 
            ENCODER_COUNTS_PER_REV, MAX_STEERING_ANGLE);
     printf("Precision: %.4f degrees per encoder count\n", 360.0f / ENCODER_COUNTS_PER_REV);
-    printf("FFB Logging: %s, Records logged: %d\n", 
-           logging_enabled ? "Enabled" : "Disabled", log_counter);
+    printf("FFB Logging: %s, Records written: %d\n",
+           atomic_load_explicit(&logging_enabled, memory_order_relaxed) ? "Enabled" : "Disabled",
+           atomic_load_explicit(&log_counter, memory_order_relaxed));
     
     // HID statistics
     int hid_write_errors, hid_read_errors, hid_reconnects;
@@ -593,6 +751,18 @@ int main(int argc, char *argv[]) {
     setup_real_time_scheduling();
     setup_signal_handlers();
     enable_raw_mode();
+
+    /* Issue #14: Pin the main loop to core 2.  Core 3 is reserved for the
+     * EtherCAT thread (isolcpus=3).  This keeps the main loop off the isolated
+     * core without interfering with HID threads on core 1.                    */
+    {
+        cpu_set_t main_cpuset;
+        CPU_ZERO(&main_cpuset);
+        CPU_SET(2, &main_cpuset);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &main_cpuset) != 0) {
+            perror("Main: failed to pin to core 2");
+        }
+    }
     
     // Initialize FFB logging
     if (init_ffb_logging() != 0) {

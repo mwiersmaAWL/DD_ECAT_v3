@@ -185,6 +185,16 @@ Tracked files that should be in `.gitignore`:
 
 ---
 
+## Tier 5. Documentation
+
+### 24. Update readme.md
+Update the readme.md file based on the changes made on to this plan.md focus on:
+- How the user should setup everything when using this setup (software whise)
+- Configure the raspberry pi for this repo usage. 
+- How to deal with faults.
+
+---
+
 ## Summary checklist
 
 | # | File(s) | Issue | Done |
@@ -195,17 +205,17 @@ Tracked files that should be in `.gitignore`:
 | 4 | `main.c` | Pause leaves torque active | [x] |
 | 5 | `main.c` | Emergency stop unreachable + auto-clears | [x] |
 | 6 | `ffb_calculator.c` | Case-label declarations, C11 error | [x] |
-| 7 | `soem_interface.c` | Partial PDO memset (5/35 bytes) | [ ] |
-| 8 | `soem_interface.c`, `main.c` | 14-bit vs 16-bit confusion | [ ] |
-| 9 | `soem_interface.c` | Interpolation time SDO wrong (10 ms → 1 ms) | [ ] |
-| 10 | `main.c` | No encoder wrap/unwrap | [ ] |
-| 11 | `create_ffb_gadget.sh` | HID descriptor not PID-compliant | [ ] |
-| 12 | `hid_interface.c` | Mutex held across 5 ms select | [ ] |
-| 13 | `hid_interface.c` | Empty gamepad report thread | [ ] |
-| 14 | `hid_interface.c`, `soem_interface.c` | CPU affinity vs isolated core mismatch | [ ] |
-| 15 | `main.c` | Blocking CSV log on RT thread | [ ] |
-| 16 | `soem_interface.c`, `hid_interface.c`, `main.c` | Data races on shared state | [ ] |
-| 17 | `soem_interface.c` | DC sync enabled but thread free-runs | [ ] |
+| 7 | `soem_interface.c` | Partial PDO memset (5/35 bytes) | [x] |
+| 8 | `soem_interface.c`, `main.c` | 14-bit vs 16-bit confusion | [x] |
+| 9 | `soem_interface.c` | Interpolation time SDO wrong (10 ms → 1 ms) | [x] |
+| 10 | `main.c` | No encoder wrap/unwrap | [x] |
+| 11 | `create_ffb_gadget.sh` | HID descriptor not PID-compliant | [x] |
+| 12 | `hid_interface.c` | Mutex held across 5 ms select | [x] |
+| 13 | `hid_interface.c` | Empty gamepad report thread | [x] |
+| 14 | `hid_interface.c`, `soem_interface.c` | CPU affinity vs isolated core mismatch | [x] |
+| 15 | `main.c` | Blocking CSV log on RT thread | [x] |
+| 16 | `soem_interface.c`, `hid_interface.c`, `main.c` | Data races on shared state | [x] |
+| 17 | `soem_interface.c` | DC sync enabled but thread free-runs | [x] |
 | 18 | `Makefile` | No header dependency tracking | [ ] |
 | 19 | `Makefile` | SOEM path hardcoded | [ ] |
 | 20 | `main.c` | `printf` in signal handlers | [ ] |

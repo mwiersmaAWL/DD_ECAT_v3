@@ -6,6 +6,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -35,27 +36,69 @@ typedef struct {
     uint16_t buttons;       // 16-bit button field
 } __attribute__((packed)) gamepad_report_t;
 
-// Fixed FFB Input Report structures matching your HID descriptor
-typedef struct {
-    uint8_t report_id;      // Report ID = 2
-    uint8_t effect_block_index;  // Effect block index
-    uint8_t effect_type;    // Effect type
-} __attribute__((packed)) ffb_pid_pool_report_t;
+/*
+ * Standard USB HID PID output report structures.
+ * All layouts must stay in sync with the HID descriptor in create_ffb_gadget.sh.
+ */
 
+/* Report ID 1 (Output): Set Effect — creates or modifies an effect in a slot. */
 typedef struct {
-    uint8_t report_id;      // Report ID = 3
-    uint8_t magnitude;      // Effect magnitude
-    uint8_t offset;         // Effect offset
-    uint8_t phase;          // Phase
-    uint8_t period;         // Period
-    uint8_t duration_low;   // Duration low byte
-    uint8_t duration_high;  // Duration high byte
-} __attribute__((packed)) ffb_set_effect_report_t;
+    uint8_t  report_id;               /* = 1 */
+    uint8_t  effect_block_index;      /* 1–FFB_EFFECT_SLOTS */
+    uint8_t  effect_type;             /* array value: 1=Constant, 2=Ramp,
+                                       * 3=Square, 4=Sine, 5=Triangle,
+                                       * 6=SawUp, 7=SawDown, 8=Spring,
+                                       * 9=Damper, 10=Inertia, 11=Friction */
+    uint16_t duration;                /* ms; 0xFFFF = infinite */
+    uint16_t trigger_repeat_interval; /* ms */
+    uint8_t  axes_dir_pad;            /* bit0=axes_enable(X), bit1=direction_enable,
+                                       * bits2-7=padding */
+    uint8_t  gain;                    /* 0–255 */
+    uint8_t  trigger_button;          /* 0–255, 0 = no trigger */
+} __attribute__((packed)) pid_set_effect_report_t;
 
-// Generic FFB report for any report ID
+/* Report ID 5 (Output): Set Constant Force — magnitude for a constant-force effect. */
+typedef struct {
+    uint8_t  report_id;           /* = 5 */
+    uint8_t  effect_block_index;
+    int16_t  magnitude;           /* -32768..32767 */
+} __attribute__((packed)) pid_set_constant_force_report_t;
+
+/* Report ID 4 (Output): Set Periodic — parameters for periodic (oscillating) effects. */
+typedef struct {
+    uint8_t  report_id;           /* = 4 */
+    uint8_t  effect_block_index;
+    uint16_t magnitude;           /* 0–65535 */
+    int16_t  offset;              /* -32768..32767 */
+    uint16_t phase;               /* 0–65535 */
+    uint16_t period;              /* ms */
+} __attribute__((packed)) pid_set_periodic_report_t;
+
+/* Report ID 10 / 0x0A (Output): Effect Operation — start or stop an effect. */
+typedef struct {
+    uint8_t report_id;            /* = 10 */
+    uint8_t effect_block_index;
+    uint8_t operation;            /* 1=Start, 2=StartSolo, 3=Stop */
+    uint8_t loop_count;           /* 0–255; 0xFF = infinite */
+} __attribute__((packed)) pid_effect_operation_report_t;
+
+/* Report ID 11 / 0x0B (Output): PID Block Free — releases an effect slot. */
+typedef struct {
+    uint8_t report_id;            /* = 11 */
+    uint8_t effect_block_index;
+} __attribute__((packed)) pid_block_free_report_t;
+
+/* Report ID 12 / 0x0C (Output): PID Device Control — device-wide commands. */
+typedef struct {
+    uint8_t report_id;            /* = 12 */
+    uint8_t device_control;       /* 1=EnableActuators, 2=DisableActuators,
+                                   * 3=StopAll, 4=DeviceReset, 5=Pause, 6=Continue */
+} __attribute__((packed)) pid_device_control_report_t;
+
+/* Generic read buffer — sized for the largest output report (10 bytes). */
 typedef struct {
     uint8_t report_id;
-    uint8_t data[16];  // Maximum data size based on your largest report
+    uint8_t data[16];  /* Sufficient for the 9-byte max PID output report payload. */
 } __attribute__((packed)) ffb_generic_report_t;
 
 // FFB Effect Slot Table — persistent storage keyed by USB PID effect block index.
@@ -79,9 +122,15 @@ static int hidg_fd = -1;
 static pthread_mutex_t hidg_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // USB connection state tracking
-static volatile int usb_connected = 0;
-static int consecutive_write_failures = 0;
+// _Atomic so the main thread and the reception thread can read/write these
+// flags without holding hidg_fd_mutex (which is now only held briefly to
+// snapshot the file descriptor, not across blocking I/O).  Issue #16.
+static _Atomic int usb_connected = 0;
+static _Atomic int consecutive_write_failures = 0;
 static struct timespec last_reconnect_attempt = {0, 0};
+// Protects last_reconnect_attempt which is a non-atomic struct timespec shared
+// between the reception thread and the main-thread send path.  Issue #16.
+static pthread_mutex_t reconnect_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Error tracking
 static int total_write_errors = 0;
@@ -94,7 +143,6 @@ static int debug_every_n_reports = 1000;  // Debug every 1000 reports
 
 // Threads
 static pthread_t ffb_reception_thread;
-static pthread_t gamepad_report_thread;
 
 // Add this helper function for time comparison
 static long timespec_diff_ms(struct timespec *start, struct timespec *end) {
@@ -116,7 +164,7 @@ static void safe_close_hid_device() {
     if (hidg_fd >= 0) {
         close(hidg_fd);
         hidg_fd = -1; // Invalidate the file descriptor
-        usb_connected = 0;
+        atomic_store_explicit(&usb_connected, 0, memory_order_release);
         printf("HIDInterface: Closed HID device\n");
     }
     pthread_mutex_unlock(&hidg_fd_mutex);
@@ -127,7 +175,7 @@ static void _close_hid_device_nolock(void) {
     if (hidg_fd >= 0) {
         close(hidg_fd);
         hidg_fd = -1;
-        usb_connected = 0;
+        atomic_store_explicit(&usb_connected, 0, memory_order_release);
         printf("HIDInterface: Closed HID device\n");
     }
 }
@@ -156,8 +204,8 @@ static int try_open_hid_device() {
         return -1;
     }
     
-    usb_connected = 1;
-    consecutive_write_failures = 0;
+    atomic_store_explicit(&usb_connected, 1, memory_order_release);
+    atomic_store_explicit(&consecutive_write_failures, 0, memory_order_relaxed);
     reconnect_count++;
     
     printf("HIDInterface: Successfully opened HID device (reconnect #%d)\n", reconnect_count);
@@ -168,20 +216,27 @@ static int try_open_hid_device() {
 
 // Check if we should attempt reconnection
 static int should_attempt_reconnect() {
-    if (usb_connected) return 0;
-    
+    /* Fast atomic check first — avoids taking reconnect_mutex on every call
+     * from the hot send path.  Issue #16.                                    */
+    if (atomic_load_explicit(&usb_connected, memory_order_relaxed)) return 0;
+
     struct timespec current_time;
     clock_gettime(CLOCK_MONOTONIC, &current_time);
-    
-    if (last_reconnect_attempt.tv_sec != 0 || last_reconnect_attempt.tv_nsec != 0) {
+
+    pthread_mutex_lock(&reconnect_mutex);
+    int result = 0;
+    if (last_reconnect_attempt.tv_sec == 0 && last_reconnect_attempt.tv_nsec == 0) {
+        last_reconnect_attempt = current_time;
+        result = 1;
+    } else {
         long elapsed_ms = timespec_diff_ms(&last_reconnect_attempt, &current_time);
-        if (elapsed_ms < USB_RECONNECT_DELAY_MS) {
-            return 0;
+        if (elapsed_ms >= USB_RECONNECT_DELAY_MS) {
+            last_reconnect_attempt = current_time;
+            result = 1;
         }
     }
-    
-    last_reconnect_attempt = current_time;
-    return 1;
+    pthread_mutex_unlock(&reconnect_mutex);
+    return result;
 }
 
 /**
@@ -223,31 +278,36 @@ static int parse_ffb_report(uint8_t *report, size_t len, ffb_motor_effect_t *eff
     clock_gettime(CLOCK_REALTIME, &effect->received_time);
     
     switch (report_id) {
-        case 2: // PID Pool Report — defines effect type for a block index
-            if (len >= sizeof(ffb_pid_pool_report_t)) {
-                ffb_pid_pool_report_t *pid_report = (ffb_pid_pool_report_t *)report;
-                effect->effect_type = pid_report->effect_type;
-                effect->type        = map_raw_effect_type(pid_report->effect_type);
-                return 1;
-            }
-            break;
-            
-        case 3: // Set Effect Report
-            if (len >= sizeof(ffb_set_effect_report_t)) {
-                ffb_set_effect_report_t *set_effect = (ffb_set_effect_report_t *)report;
-                effect->magnitude = (set_effect->magnitude - 128) / 128.0f;
-                effect->duration_ms = (set_effect->duration_high << 8) | set_effect->duration_low;
-                return 1;
-            }
-            break;
-            
-        // Add other report types as needed
+        case 1: { /* Set Effect — defines type, duration, and gain for an effect slot. */
+            if (len < sizeof(pid_set_effect_report_t)) return 0;
+            const pid_set_effect_report_t *r = (const pid_set_effect_report_t *)report;
+            effect->effect_type = r->effect_type;
+            effect->type        = map_raw_effect_type(r->effect_type);
+            /* duration 0xFFFF means infinite; map to duration_ms == 0 for that convention */
+            effect->duration_ms = (r->duration == 0xFFFF) ? 0 : (int)r->duration;
+            return 1;
+        }
+        case 5: { /* Set Constant Force — magnitude for ID_CONSTANT_FORCE slots. */
+            if (len < sizeof(pid_set_constant_force_report_t)) return 0;
+            const pid_set_constant_force_report_t *r =
+                (const pid_set_constant_force_report_t *)report;
+            effect->magnitude = (float)r->magnitude / 32767.0f;
+            return 1;
+        }
+        case 4: { /* Set Periodic — magnitude, offset, phase, period for periodic slots. */
+            if (len < sizeof(pid_set_periodic_report_t)) return 0;
+            const pid_set_periodic_report_t *r = (const pid_set_periodic_report_t *)report;
+            effect->magnitude = (float)r->magnitude / 65535.0f;
+            effect->direction = (float)r->offset; /* direction reused as offset per ffb_types.h */
+            return 1;
+        }
+        case 10: /* Effect Operation — start/stop handled entirely in thread */
+        case 11: /* PID Block Free — slot release handled in thread */
+        case 12: /* PID Device Control — device-wide command handled in thread */
+            return 1;
         default:
-            // Unknown report type
             return 0;
     }
-    
-    return 0;
 }
 
 // FFB reception thread with improved error handling
@@ -276,10 +336,16 @@ static void* _usb_ffb_reception_thread(void* arg) {
         }
         
         // Only try to read if we're connected
-        if (usb_connected) {
+        if (atomic_load_explicit(&usb_connected, memory_order_acquire)) {
+            /* Issue #12: Snapshot the fd under a brief lock, then release the
+             * mutex before the blocking select()/read().  If the fd is closed
+             * concurrently, select()/read() return EBADF which is handled as a
+             * recoverable error below.  This prevents the main thread from
+             * waiting up to 5 ms to acquire hidg_fd_mutex on every cycle.     */
             pthread_mutex_lock(&hidg_fd_mutex);
             int fd = hidg_fd;
-            
+            pthread_mutex_unlock(&hidg_fd_mutex);
+
             if (fd >= 0) {
                 fd_set read_fds;
                 struct timeval tv;
@@ -295,9 +361,7 @@ static void* _usb_ffb_reception_thread(void* arg) {
                     read_failures++;
                     total_read_errors++;
                     if (read_failures > 10) {
-                        // Bug fix: safe_close_hid_device() takes the mutex — deadlock here.
-                        // Use nolock variant since hidg_fd_mutex is already held.
-                        _close_hid_device_nolock();
+                        safe_close_hid_device(); /* acquires hidg_fd_mutex internally */
                         read_failures = 0;
                     }
                 } else if (retval) {
@@ -307,34 +371,91 @@ static void* _usb_ffb_reception_thread(void* arg) {
                         
                         ffb_motor_effect_t new_effect;
                         if (parse_ffb_report((uint8_t*)&ffb_report, (size_t)len, &new_effect)) {
-                            /* Determine which slot to update.  Report 2 carries an explicit
-                             * effect block index in byte 1 (ffb_pid_pool_report_t layout).
-                             * All other reports update the most recently referenced slot. */
-                            int block_idx = last_block_index;
-                            if (new_effect.report_id == 2) {
-                                /* ffb_report.data[0] == effect_block_index */
-                                block_idx = (int)(ffb_report.data[0] % FFB_EFFECT_SLOTS);
-                                last_block_index = block_idx;
-                            }
+                            uint8_t report_id = new_effect.report_id;
 
-                            pthread_mutex_lock(&slot_mutex);
-                            effect_slot_t *slot = &effect_slots[block_idx];
-                            if (new_effect.report_id == 2) {
-                                /* New effect: initialise or overwrite the slot */
-                                slot->effect   = new_effect;
-                                slot->occupied = 1;
-                                slot->running  = 1;
-                                clock_gettime(CLOCK_MONOTONIC, &slot->start_time);
-                            } else if (slot->occupied) {
-                                /* Parameter update: merge into existing slot, preserve type */
-                                ffb_effect_type_t saved_type = slot->effect.type;
-                                slot->effect.magnitude   = new_effect.magnitude;
-                                slot->effect.duration_ms = new_effect.duration_ms;
-                                slot->effect.type        = saved_type;
-                                slot->running = 1;
-                                clock_gettime(CLOCK_MONOTONIC, &slot->start_time);
+                            /* PID Device Control (ID 12) has no effect_block_index; handle
+                             * separately so it doesn't corrupt last_block_index. */
+                            if (report_id == 12) {
+                                if (len >= (ssize_t)sizeof(pid_device_control_report_t)) {
+                                    const pid_device_control_report_t *ctrl =
+                                        (const pid_device_control_report_t *)&ffb_report;
+                                    pthread_mutex_lock(&slot_mutex);
+                                    switch (ctrl->device_control) {
+                                        case 3: /* Stop All Effects */
+                                            for (int s = 0; s < FFB_EFFECT_SLOTS; s++) {
+                                                effect_slots[s].running = 0;
+                                            }
+                                            break;
+                                        case 4: /* Device Reset */
+                                            for (int s = 0; s < FFB_EFFECT_SLOTS; s++) {
+                                                effect_slots[s].running  = 0;
+                                                effect_slots[s].occupied = 0;
+                                            }
+                                            break;
+                                        default:
+                                            break; /* Pause/Continue/Enable/Disable: no slot change */
+                                    }
+                                    pthread_mutex_unlock(&slot_mutex);
+                                }
+                            } else {
+                                /* All other recognised PID output reports carry
+                                 * effect_block_index as the first data byte. */
+                                int block_idx = (int)(ffb_report.data[0] % FFB_EFFECT_SLOTS);
+                                last_block_index = block_idx;
+
+                                pthread_mutex_lock(&slot_mutex);
+                                effect_slot_t *slot = &effect_slots[block_idx];
+
+                                switch (report_id) {
+                                    case 1: /* Set Effect: initialise or overwrite the slot */
+                                        slot->effect   = new_effect;
+                                        slot->occupied = 1;
+                                        /* Effect only starts when Effect Operation Start arrives */
+                                        slot->running  = 0;
+                                        break;
+                                    case 5: /* Set Constant Force */
+                                    case 4: /* Set Periodic */
+                                        if (slot->occupied) {
+                                            ffb_effect_type_t saved_type = slot->effect.type;
+                                            slot->effect.magnitude = new_effect.magnitude;
+                                            slot->effect.direction = new_effect.direction;
+                                            slot->effect.type      = saved_type;
+                                        }
+                                        break;
+                                    case 10: { /* Effect Operation */
+                                        if (slot->occupied &&
+                                            len >= (ssize_t)sizeof(pid_effect_operation_report_t)) {
+                                            const pid_effect_operation_report_t *op =
+                                                (const pid_effect_operation_report_t *)&ffb_report;
+                                            switch (op->operation) {
+                                                case 1: /* Start */
+                                                    slot->running = 1;
+                                                    clock_gettime(CLOCK_MONOTONIC, &slot->start_time);
+                                                    break;
+                                                case 2: /* Start Solo: stop all others first */
+                                                    for (int s = 0; s < FFB_EFFECT_SLOTS; s++) {
+                                                        if (s != block_idx) {
+                                                            effect_slots[s].running = 0;
+                                                        }
+                                                    }
+                                                    slot->running = 1;
+                                                    clock_gettime(CLOCK_MONOTONIC, &slot->start_time);
+                                                    break;
+                                                case 3: /* Stop */
+                                                    slot->running = 0;
+                                                    break;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    case 11: /* PID Block Free */
+                                        slot->occupied = 0;
+                                        slot->running  = 0;
+                                        break;
+                                }
+
+                                pthread_mutex_unlock(&slot_mutex);
                             }
-                            pthread_mutex_unlock(&slot_mutex);
                         }
                     } else if (len < 0) {
                         if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -342,15 +463,13 @@ static void* _usb_ffb_reception_thread(void* arg) {
                             read_failures++;
                             total_read_errors++;
                             if (read_failures > 10) {
-                                // Bug fix: deadlock — use nolock variant
-                                _close_hid_device_nolock();
+                                safe_close_hid_device(); /* acquires hidg_fd_mutex internally */
                                 read_failures = 0;
                             }
                         }
                     }
                 }
             }
-            pthread_mutex_unlock(&hidg_fd_mutex);
         }
         
         // Small delay to prevent busy waiting
@@ -358,50 +477,6 @@ static void* _usb_ffb_reception_thread(void* arg) {
     }
 
     printf("FFB: Reception thread stopped\n");
-    return NULL;
-}
-
-// Simplified gamepad report sending thread
-static void* _gamepad_report_loop(void* arg) {
-    (void)arg;
-
-    // Bug fix: both threads were pinned to core 1, competing for the same CPU.
-    // Assign gamepad thread to core 2, FFB reception thread stays on core 1.
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(2, &cpuset);
-    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
-        perror("Gamepad Report Thread: Failed to set CPU affinity");
-    }
-
-    printf("HIDInterface: Gamepad report thread started\n");
-
-    struct timespec loop_start_time, loop_end_time;
-
-    while (hid_running) {
-        clock_gettime(CLOCK_MONOTONIC, &loop_start_time);
-
-        // The main loop will call hid_interface_send_gamepad_report() directly
-        // This thread just maintains the timing for potential future use
-        
-        // Periodic debugging output
-        report_counter++;
-        if (report_counter % debug_every_n_reports == 0) {
-            printf("HID Thread Status: Connected=%s, WriteErr=%d, ReadErr=%d\n",
-                   usb_connected ? "YES" : "NO", total_write_errors, total_read_errors);
-        }
-        
-        // Enforce the send interval
-        clock_gettime(CLOCK_MONOTONIC, &loop_end_time);
-        long elapsed_ms = timespec_diff_ms(&loop_start_time, &loop_end_time);
-        long sleep_time_ms = HID_SEND_INTERVAL_MS - elapsed_ms;
-
-        if (sleep_time_ms > 0) {
-            usleep(sleep_time_ms * 1000);
-        }
-    }
-
-    printf("HIDInterface: Gamepad report thread stopped\n");
     return NULL;
 }
 
@@ -428,20 +503,16 @@ int hid_interface_init() {
  */
 int hid_interface_start() {
     hid_running = 1;
-    
+
+    /* Issue #13: The gamepad report thread was an empty timing shell that did
+     * nothing except print stats.  Reports are sent directly from the main
+     * loop via hid_interface_send_gamepad_report().  Thread removed.         */
     if (pthread_create(&ffb_reception_thread, NULL, _usb_ffb_reception_thread, NULL) != 0) {
         perror("HIDInterface: Failed to create FFB reception thread");
         return -1;
     }
-    
-    if (pthread_create(&gamepad_report_thread, NULL, _gamepad_report_loop, NULL) != 0) {
-        perror("HIDInterface: Failed to create gamepad report thread");
-        pthread_cancel(ffb_reception_thread);
-        pthread_join(ffb_reception_thread, NULL);
-        return -1;
-    }
-    
-    printf("HIDInterface: Started FFB reception and gamepad report threads.\n");
+
+    printf("HIDInterface: Started FFB reception thread.\n");
     return 0;
 }
 
@@ -450,14 +521,9 @@ int hid_interface_start() {
  */
 void hid_interface_stop() {
     hid_running = 0;
-    
-    // Wait for threads to finish
+
     if (ffb_reception_thread) {
         pthread_join(ffb_reception_thread, NULL);
-    }
-    
-    if (gamepad_report_thread) {
-        pthread_join(gamepad_report_thread, NULL);
     }
 
     safe_close_hid_device();
@@ -646,7 +712,7 @@ int hid_interface_send_gamepad_report(float normalized_position, unsigned int bu
  * @brief Get connection status
  */
 int hid_interface_get_connection_status() {
-    return usb_connected;
+    return atomic_load_explicit(&usb_connected, memory_order_relaxed);
 }
 
 /**
